@@ -22,6 +22,7 @@ import json as _json
 import logging
 import random
 import string
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -32,11 +33,56 @@ from .base import ConfigField, MailProvider, extract_otp, register
 
 logger = logging.getLogger(__name__)
 
+_domain_rr_lock = threading.Lock()
+_domain_rr_seq = 0
+
 
 def _gen_local_part(rng: Optional[random.Random] = None, length: int = 10) -> str:
     """生成随机邮箱前缀。参考 any-auto-register 用 10 位 lowercase+digits。"""
     r = rng or random
     return "".join(r.choices(string.ascii_lowercase + string.digits, k=length))
+
+
+def _parse_domain_list(raw: str) -> list[str]:
+    """解析 cf_domain：支持英文/中文逗号、分号、换行；去掉误填的 URL。"""
+    if not raw:
+        return []
+    s = raw.replace("，", ",").replace(";", ",").replace("\n", ",")
+    out: list[str] = []
+    for part in s.split(","):
+        p = part.strip().lower()
+        if not p:
+            continue
+        for prefix in ("https://", "http://"):
+            if p.startswith(prefix):
+                p = p[len(prefix):]
+        p = p.split("/")[0].strip()
+        if p:
+            out.append(p)
+    return out
+
+
+def _pick_domain(
+    domains: list[str],
+    *,
+    settings: dict,
+    account: Optional[dict],
+    rng: random.Random,
+) -> str:
+    """选收件域：批量 worker 按 id 固定一域；否则全局轮询；可配置 random。"""
+    if not domains:
+        raise ValueError("domain list empty")
+    mode = (settings.get("cf_domain_mode") or "sticky").strip().lower()
+    if account is not None and account.get("cf_domain_index") is not None:
+        idx = int(account["cf_domain_index"])
+        return domains[idx % len(domains)]
+    if mode == "random":
+        return rng.choice(domains)
+    global _domain_rr_seq
+    with _domain_rr_lock:
+        idx = _domain_rr_seq
+        _domain_rr_seq += 1
+    return domains[idx % len(domains)]
 
 
 # OTP 抽取已上提到 base.extract_otp（与 outlook 共用同一套防误判规则）。
@@ -78,8 +124,13 @@ class CFTempEmailProvider(MailProvider):
         ),
         ConfigField(
             "cf_domain", "收件域名",
-            placeholder="example.com",
-            help="已配置 catch-all 的域名",
+            placeholder="example.com 或 a.com,b.com",
+            help="多个域名英文逗号分隔；批量并发时按 worker 固定分域，单次注册按轮询分散",
+        ),
+        ConfigField(
+            "cf_domain_mode", "多域策略",
+            placeholder="sticky / round_robin / random",
+            help="sticky=批量按 worker 分域（推荐）；round_robin=全局轮询；random=随机",
         ),
     ]
 
@@ -92,15 +143,19 @@ class CFTempEmailProvider(MailProvider):
     ):
         if not api_url:
             raise ValueError("api_url 不能为空")
-        if not domain:
-            raise ValueError("domain 不能为空")
+        self._domains = _parse_domain_list(domain)
+        if not self._domains:
+            raise ValueError("domain 不能为空或格式无效")
         self.api_url = api_url.rstrip("/")
         self.admin_token = admin_token
-        self.domain = domain
+        # 仅存单个域，避免旧代码把整段 CSV 当 domain 传给 Worker
+        self.domain = self._domains[0]
         self._jwt: str = ""
         self._current_email: str = ""
         self._seen_mail_ids: set = set()
         self._rng = random.Random()
+        self._mail_settings = {}
+        self._mail_account: Optional[dict] = None
         self.last_persona = None
 
         # 用 curl_cffi 模拟 Chrome 指纹，过 CF Bot Fight Mode
@@ -126,7 +181,10 @@ class CFTempEmailProvider(MailProvider):
                 "CF Temp Email 未配置完整（缺 api_url / domain / admin_token），"
                 "请去「邮箱配置」Tab 填写"
             )
-        return cls(api_url=api_url, admin_token=token, domain=domain)
+        inst = cls(api_url=api_url, admin_token=token, domain=domain)
+        inst._mail_settings = dict(settings or {})
+        inst._mail_account = account
+        return inst
 
     # ──────────────────────── HTTP 工具 ────────────────────────
 
@@ -214,16 +272,28 @@ class CFTempEmailProvider(MailProvider):
     def create_mailbox(self) -> str:
         """创建一个新邮箱：POST /admin/new_address，拿 JWT。
 
-        关键参数（来自 any-auto-register 实战）：
-          enablePrefix=True   必须，否则部分部署会返回 400
-          name=<10位随机>     邮箱前缀
+        关键参数：
+          enablePrefix=False  避免 Worker PREFIX（常见 tmp）拼到前缀
+          name=<10位随机>     邮箱本地段
           domain=<主人域名>   catch-all 收件域
         """
-        local = _gen_local_part(self._rng, length=10)
+        local = _gen_local_part(self._rng, length=12)
+        pick_domain = _pick_domain(
+            self._domains,
+            settings=self._mail_settings,
+            account=self._mail_account,
+            rng=self._rng,
+        )
+        logger.info(
+            "[cf_temp] new_address local=%s domain=%s (pool=%s)",
+            local[:4] + "…",
+            pick_domain,
+            ",".join(self._domains),
+        )
         payload = {
-            "enablePrefix": True,
+            "enablePrefix": False,
             "name": local,
-            "domain": self.domain,
+            "domain": pick_domain,
         }
         resp = self._request("POST", "/admin/new_address", json=payload, timeout=15)
         status = getattr(resp, "status_code", 0)
@@ -260,6 +330,10 @@ class CFTempEmailProvider(MailProvider):
             timeout=10,
         )
         status = getattr(resp, "status_code", 0)
+        if status == 429:
+            logger.warning("[cf_temp] /admin/mails 429，退避 2s")
+            time.sleep(2)
+            return []
         if status != 200:
             logger.debug(f"[cf_temp] /admin/mails 返回 {status}")
             return []
@@ -324,9 +398,36 @@ class CFTempEmailProvider(MailProvider):
         - 借鉴 any-auto-register：按 id desc 排序，新邮件优先
         - OTP 抽取规则严谨（见 base.extract_otp）
         """
-        timeout = max(int(timeout), 60)
+        timeout = max(int(timeout), 120)
+        domain = (email_addr or "").split("@")[-1].strip().lower()
+        from mail_otp_limit import acquire_otp_slot, release_otp_slot
+
+        slot_wait = min(float(timeout), 600.0)
+        if domain and not acquire_otp_slot(domain, timeout=slot_wait):
+            raise TimeoutError(
+                f"CFTempEmail OTP slot wait timeout ({slot_wait:.0f}s) for @{domain}"
+            )
         deadline = time.time() + timeout
         logger.info(f"[cf_temp] 等待 OTP -> {email_addr} (timeout={timeout}s)")
+        try:
+            return self._wait_for_otp_inner(
+                email_addr,
+                deadline=deadline,
+                timeout=timeout,
+                issued_after=issued_after,
+            )
+        finally:
+            if domain:
+                release_otp_slot(domain)
+
+    def _wait_for_otp_inner(
+        self,
+        email_addr: str,
+        *,
+        deadline: float,
+        timeout: int,
+        issued_after: Optional[float] = None,
+    ) -> str:
 
         # 起始 seen_ids：当前邮箱里已有的邮件 id（避免被旧邮件污染）
         #
@@ -348,7 +449,6 @@ class CFTempEmailProvider(MailProvider):
                 if issued_after is not None:
                     ts = self._mail_epoch(m)
                     if ts is not None and ts >= issued_after - 2:
-                        # 这封是我们要等的信，别标记成旧信
                         kept += 1
                         continue
                 self._seen_mail_ids.add(mid)
@@ -362,7 +462,6 @@ class CFTempEmailProvider(MailProvider):
         while time.time() < deadline:
             try:
                 mails = self._get_mails(email_addr)
-                # 按 id 倒序：最新的邮件优先
                 for mail in sorted(mails, key=lambda x: x.get("id", 0), reverse=True):
                     mid = str(mail.get("id", ""))
                     if not mid or mid in self._seen_mail_ids:
@@ -377,7 +476,6 @@ class CFTempEmailProvider(MailProvider):
                             f"raw_len={len(raw)}"
                         )
                         return otp
-                    # 没匹配到也记日志便于排查
                     logger.debug(
                         f"[cf_temp] mail id={mid} 未匹配到 OTP "
                         f"(subject={mail.get('subject','')[:50]})"

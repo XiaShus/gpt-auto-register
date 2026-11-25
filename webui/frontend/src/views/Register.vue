@@ -38,8 +38,28 @@ async function run() {
       otp_timeout: parseInt(form.value.otpTimeout, 10) || 10,
       want_access_token: true,
       want_session_token: true,
-      want_refresh_token: true,
+      want_refresh_token: form.value.wantRefreshToken,
       want_2fa: form.value.want2fa,
+      zooproxy_enabled: form.value.zooproxyEnabled,
+      zooproxy_mode: form.value.zooproxyMode,
+      zooproxy_api_url: form.value.zooproxyApiUrl,
+      zooproxy_scheme: form.value.zooproxyScheme,
+      zooproxy_gateway_host: form.value.zooproxyGatewayHost,
+      zooproxy_gateway_account: form.value.zooproxyGatewayAccount,
+      zooproxy_gateway_password: form.value.zooproxyGatewayPassword,
+      zooproxy_gateway_region: form.value.zooproxyGatewayRegion,
+      zooproxy_gateway_session_minutes: form.value.zooproxyGatewaySessionMinutes,
+      ipwo_enabled: form.value.ipwoEnabled,
+      ipwo_host: form.value.ipwoHost,
+      ipwo_username: form.value.ipwoUsername,
+      ipwo_password: form.value.ipwoPassword,
+      ipwo_zone: form.value.ipwoZone,
+      ipwo_scheme: form.value.ipwoScheme,
+      ipwo_session_minutes: form.value.ipwoSessionMinutes,
+      proxy_multi_country: form.value.proxyMultiCountry,
+      proxy_countries_zoo: form.value.proxyCountriesZoo,
+      proxy_countries_ipwo: form.value.proxyCountriesIpwo,
+      proxy_dual_mode: form.value.proxyDualMode,
     })
     runtime.addLog(`[client] 启动注册 run_id=${r.run_id} email=${r.email}`, 'evt')
     runtime.streamRun(r.run_id)
@@ -73,9 +93,16 @@ async function copyField(email, field) {
             <el-form-item label="邮箱（留空 = 自动 claim 下一个 available）">
               <el-input v-model="regEmail" placeholder="留空 = 自动选号 / 或填指定邮箱" clearable />
             </el-form-item>
+            <el-form-item label="ZooProxy 动态 IP">
+              <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px">
+                <el-switch v-model="form.zooproxyEnabled" />
+                <span class="hint">开启后本次忽略下方单代理，每号拉新 IP</span>
+              </div>
+            </el-form-item>
             <el-form-item label="本次使用的单个代理（可从代理池选，或手动输入；直连留空）">
               <el-select
                 v-model="form.proxy" filterable clearable allow-create default-first-option
+                :disabled="form.zooproxyEnabled || form.ipwoEnabled"
                 :reserve-keyword="false" placeholder="socks5://user:pass@host:1080"
                 style="width: 100%"
               >
@@ -84,6 +111,10 @@ async function copyField(email, field) {
               <div class="hint" style="margin-top: 4px">
                 Plus 检测、自动批量的兜底代理都复用这里；批量并发轮换请到「代理池」页管理。
               </div>
+            </el-form-item>
+            <el-form-item label="Codex refresh_token">
+              <el-switch v-model="form.wantRefreshToken" />
+              <span class="hint" style="margin-left: 8px">默认关；ChatGPT2API 用 session 即可</span>
             </el-form-item>
             <el-form-item label="OTP 等待秒数">
               <el-input-number v-model="form.otpTimeout" :min="10" :max="600" />

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import sys
 import threading
@@ -112,12 +113,31 @@ _NETWORK_ERROR_PATTERNS = [
     "curl: (35)", "curl: (28)", "curl: (6)", "curl: (7)",
     "remote disconnected", "connection reset", "connection aborted",
     "max retries exceeded",
-    "invalid_state",
 ]
+
+# 会话/风控层错误：不算号的错（号还能用），但重试收益会迅速衰减，
+# 且**不能无限重试**。单独归类是为了让 registrar 走 attempts 熔断，
+# 而不是像网络错误那样无条件 release 回池（那正是毒邮箱被跑 33 次的成因）。
+_FLAGGED_ERROR_PATTERNS = [
+    "invalid_state",
+    "http 409",
+    "status=409",
+    "session is no longer valid",
+]
+
+# 同一邮箱最多尝试几次。实测重试确实有收益（第 4 次仍有 ~69% 成功），
+# 所以不能一刀切禁重试；但长尾（有号被跑 27/33 次）是纯浪费，必须封顶。
+# 可用 AUTO_MAX_EMAIL_ATTEMPTS 覆盖。
+def _max_email_attempts() -> int:
+    raw = (os.getenv("AUTO_MAX_EMAIL_ATTEMPTS") or "").strip()
+    try:
+        return max(1, int(raw)) if raw else 5
+    except ValueError:
+        return 5
 
 
 def classify_error(err: str, mail_source: str = "") -> str:
-    """分类错误：'network'（环境/代理问题，号无辜）/ 'account'（号本身有问题）/ 'unknown'。
+    """分类错误：'network'（环境/代理问题，号无辜）/ 'account'（号本身有问题）/ 'flagged'（会话/风控）/ 'unknown'。
 
     mail_source 用来问 provider 要不要豁免某些模式 —— 比如 iCloud 中转号
     本来就是买的老号，"已有账号"是正常流程不是失败（见
@@ -146,6 +166,9 @@ def classify_error(err: str, mail_source: str = "") -> str:
     # 先匹配 account 特征（更具体），避免子串误命中（如 "outlook OTP timeout" 含 "timeout"）
     if any(p in s for p in account_patterns):
         return "account"
+    # 再匹配 flagged（409/invalid_state 常同时含 "timeout"/"connection" 等泛化词）
+    if any(p in s for p in _FLAGGED_ERROR_PATTERNS):
+        return "flagged"
     if any(p in s for p in _NETWORK_ERROR_PATTERNS):
         return "network"
     return "unknown"
@@ -190,6 +213,11 @@ def _do_register(
     except MailProviderError:
         is_pooled = True
 
+    proxy_cell = None
+    proxy_label = ""
+    proxy_run_ok = False
+    proxy_run_err = ""
+
     try:
         # 本次注册专属的配置覆盖。
         # ⚠️ 以前是写 os.environ + finally 还原，但 auto_loop 并发跑多个 worker，
@@ -201,16 +229,60 @@ def _do_register(
         # auth_flow 会误判为"已有账号"分支 → 不设 WEBUI_ALLOW_LOGIN 会 fast-fail。
         # 单号 WebUI 场景下 fast-fail 没意义（批量跑才需要"跳过被识别的号"），故强制 ON。
         env_overrides["WEBUI_ALLOW_LOGIN"] = "1"
-        env_overrides["OTP_TIMEOUT"] = str(int(options.get("otp_timeout") or 180))
+        try:
+            otp_sec = int(options.get("otp_timeout") or 0)
+        except (TypeError, ValueError):
+            otp_sec = 0
+        env_overrides["OTP_TIMEOUT"] = str(max(120, otp_sec or 180))
         # 用户不要 refresh_token → 直接跳过 Codex OAuth（每次都失败浪费 ~10s + 一堆告警）
-        if not options.get("want_refresh_token", True):
+        if not options.get("want_refresh_token", False):
             env_overrides["SKIP_OAUTH_TOKEN_EXCHANGE"] = "1"
             env_overrides["OAUTH_CODEX_RT_EXCHANGE"] = "0"
             env_overrides["OAUTH_CODEX_RT_BEFORE_CALLBACK"] = "0"
+        else:
+            env_overrides["OAUTH_CODEX_RT_EXCHANGE"] = "1"
+            env_overrides["OAUTH_CODEX_RT_ALLOW_RETRY"] = "1"
+            env_overrides["OAUTH_CODEX_RT_MAX_ATTEMPTS"] = "3"
+            env_overrides["OAUTH_CODEX_ADD_PHONE_REFRESH_RETRY"] = "1"
         # PROXY 走 cfg.proxy，无需 env
 
         cfg = Config()
         cfg.proxy = (options.get("proxy") or "").strip() or None
+        # 换出口 IP 回调：AutoLoop 注入时用它；单次注册在下面自行解析格子后补上。
+        rotate_cb = options.get("proxy_rotate")
+        if callable(rotate_cb):
+            cfg.proxy_rotate = rotate_cb
+        if not cfg.proxy:
+            try:
+                from proxy_pool import (
+                    DynamicProxyError,
+                    dynamic_proxy_enabled,
+                    resolve_for_run,
+                    rotate_cell_proxy,
+                )
+            except ImportError:
+                dynamic_proxy_enabled = lambda _o: bool(_o.get("zooproxy_enabled"))  # noqa: E731
+                resolve_for_run = None
+                rotate_cell_proxy = None
+                DynamicProxyError = RuntimeError  # type: ignore
+
+            if dynamic_proxy_enabled(options) and resolve_for_run is not None:
+                slot = int(time.time()) // 5
+                try:
+                    cfg.proxy, proxy_label, proxy_cell = resolve_for_run(
+                        options, worker_id=0, run_slot=slot
+                    )
+                    if rotate_cell_proxy is not None and proxy_cell is not None:
+                        cfg.proxy_rotate = (
+                            lambda cell=proxy_cell: rotate_cell_proxy(options, cell)
+                        )
+                    logging.getLogger("registrar").info(
+                        "[register] 动态代理 %s: %s",
+                        proxy_label,
+                        cfg.proxy.split("@")[-1],
+                    )
+                except DynamicProxyError as e:
+                    raise RuntimeError(str(e)) from e
 
         # ─ 邮箱来源路由 ─
         # 原来是 if cf_temp / else outlook 的写死分支，加一种邮箱就得回来改。
@@ -297,7 +369,7 @@ def _do_register(
             d = flow.result.to_dict()
             need_access = options.get("want_access_token", True)
             need_session = options.get("want_session_token", True)
-            need_refresh = options.get("want_refresh_token", True)
+            need_refresh = options.get("want_refresh_token", False)
             # 用户勾选的凭证全拿到 → 算正常完成（不视为 partial）
             wanted_ok = (
                 (not need_access or d.get("access_token"))
@@ -330,7 +402,7 @@ def _do_register(
         if options.get("want_session_token", True):
             d["session_token"] = full.get("session_token", "")
             d["cookie_header"] = full.get("cookie_header", "")  # 同样是浏览器注入用
-        if options.get("want_refresh_token", True):
+        if options.get("want_refresh_token", False):
             d["refresh_token"] = full.get("refresh_token", "")
             d["id_token"] = full.get("id_token", "")
 
@@ -441,9 +513,11 @@ def _do_register(
             f"rt={result_summary['refresh_token_len']}"
         )
         db.finish_run(run_id, "done")
+        proxy_run_ok = True
 
     except Exception as e:
         err = str(e)
+        proxy_run_err = err
         category = classify_error(err, mail_source)
         logging.getLogger("registrar").error(f"[register] 失败 (category={category}): {err}")
         # ⚠️ 密码是在 register_password 里现生成的，只活在内存里。
@@ -463,17 +537,44 @@ def _do_register(
             logging.getLogger("registrar").error(traceback.format_exc())
         # 非池化 provider 没有号池记录，不操作
         if is_pooled:
-            if category == "network":
-                db.release_unused(email)
-                logging.getLogger("registrar").warning(
-                    f"[register] {email} 判定为网络/环境错误，号已 release 回 available"
-                )
-            else:
+            if category == "account":
                 db.mark_failed(email, f"[{category}] {err}")
+            else:
+                # 网络/会话层失败：计一次尝试，到上限才熔断。
+                # 以前对 network 一律 release，等于给死号无限续命。
+                attempts = db.bump_attempts(email)
+                limit = _max_email_attempts()
+                if attempts >= limit:
+                    db.mark_failed(
+                        email,
+                        f"[{category}] 累计尝试 {attempts} 次仍未成功，已熔断: {err}",
+                    )
+                    logging.getLogger("registrar").warning(
+                        f"[register] {email} 已达尝试上限 {limit}（category={category}），"
+                        "标记 failed 停止重试"
+                    )
+                else:
+                    db.release_unused(email)
+                    logging.getLogger("registrar").warning(
+                        f"[register] {email} 判定为{category}类错误"
+                        f"（第 {attempts}/{limit} 次），号已 release 回 available"
+                    )
         db.finish_run(run_id, "failed", err, category=category)
         _emit_status(run_id, "error", {"message": err, "category": category})
 
     finally:
+        if proxy_cell is not None:
+            try:
+                from proxy_pool import finish_proxy_run
+
+                finish_proxy_run(
+                    proxy_cell,
+                    proxy_label=proxy_label,
+                    ok=proxy_run_ok,
+                    err=proxy_run_err,
+                )
+            except ImportError:
+                pass
         # env 覆盖现在只挂在 AuthFlow 实例上，随实例一起回收，无需还原。
         # 关闭 handler
         try:
@@ -491,24 +592,12 @@ def _do_register(
 
 
 def _try_export_to_panels(run_id: str, cred: dict) -> None:
-    """注册完成后可选地把凭证导出到 CPA / SUB2API 面板。
+    """注册完成后把凭证推送到「推送目标」里的一个渠道。
 
-    - 任一目标的"启用"开关关闭时,该目标跳过(不发请求);两者都未启用时整段 no-op。
-    - 任何异常都不抛,只 emit 日志/状态(不影响注册主流程)。
+    策略（见计划决策 42）：按 weight 随机选一个 enabled 目标，默认全为 1 即 1:1。
+    推送失败不丢号：结果写进 registered.extra_json.push，账号可由前端批量重推。
+    任何异常都不抛，只 emit 日志/状态（不影响注册主流程）。
     """
-    try:
-        cfg = db.get_export_internal_config()
-    except Exception as e:
-        logging.getLogger("registrar").warning(f"[export] 读取配置失败: {e}")
-        return
-
-    cpa_enabled = bool(cfg.get("cpa", {}).get("enabled"))
-    sub2api_enabled = bool(cfg.get("sub2api", {}).get("enabled"))
-    if not (cpa_enabled or sub2api_enabled):
-        return  # 用户没勾选任何目标 → 完全不执行
-
-    from . import exporter  # 懒 import,避免未启用时强依赖
-
     explog = logging.getLogger("registrar")
 
     def _log(msg: str, level: str = "info") -> None:
@@ -524,26 +613,48 @@ def _try_export_to_panels(run_id: str, cred: dict) -> None:
             pass
 
     try:
-        results = exporter.run_exports(
-            cred,
-            cpa_cfg=cfg.get("cpa") if cpa_enabled else None,
-            sub2api_cfg=cfg.get("sub2api") if sub2api_enabled else None,
-            log_fn=_log,
-        )
+        target = db.pick_push_target()
     except Exception as e:
-        _log(f"导出整体异常: {e}", "error")
+        explog.warning(f"[export] 读取推送目标失败: {e}")
         return
+    if not target:
+        return  # 没有启用的目标 → 完全不执行
 
-    # 汇总成一个事件给前端
-    summary = {}
-    if results.get("cpa") is not None:
-        summary["cpa"] = {"ok": bool(results["cpa"].get("ok")),
-                          "message": results["cpa"].get("message") or results["cpa"].get("error") or ""}
-    if results.get("sub2api") is not None:
-        summary["sub2api"] = {"ok": bool(results["sub2api"].get("ok")),
-                              "message": results["sub2api"].get("message") or results["sub2api"].get("error") or ""}
+    from . import exporter  # 懒 import,避免未推送时强依赖
+
+    email = str(cred.get("email") or "").strip()
+    _log(f"选中推送目标: {target.get('name')} ({target.get('type')}) 权重={target.get('weight')}")
+
     try:
-        _emit_status(run_id, "phase", {"phase": "export_done", "summary": summary})
+        result = exporter.run_exports_to_target(cred, target, log_fn=_log)
+    except Exception as e:
+        result = {"ok": False, "error": str(e)}
+        _log(f"推送整体异常: {e}", "error")
+
+    ok = bool(result.get("ok"))
+    message = str(result.get("message") or result.get("error") or "")
+    push_record = {
+        "target_id": target.get("id"),
+        "target_name": target.get("name"),
+        "type": target.get("type"),
+        "ok": ok,
+        "message": message[:500],
+        "at": time.time(),
+    }
+    try:
+        db.mark_registered_push(email, push_record)
+    except Exception as e:
+        explog.warning(f"[export] 写入推送结果失败: {e}")
+    try:
+        db.record_push_result(int(target.get("id") or 0), ok, message)
+    except Exception:
+        pass
+
+    try:
+        _emit_status(run_id, "phase", {
+            "phase": "export_done",
+            "summary": {str(target.get("type")): {"ok": ok, "message": message}},
+        })
     except Exception:
         pass
 

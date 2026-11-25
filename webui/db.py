@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import json
+import random
 import sqlite3
 import sys
 import threading
@@ -58,7 +59,10 @@ def init_db():
             imported_at     REAL,
             claimed_at      REAL,
             finished_at     REAL,
-            fail_reason     TEXT
+            fail_reason     TEXT,
+            attempts        INTEGER NOT NULL DEFAULT 0
+                            -- 该邮箱被尝试注册的次数（跨 claim）。
+                            -- 网络/会话类失败不再无限 release 回池，见 attempts 上限。
         );
 
         CREATE INDEX IF NOT EXISTS idx_outlook_status ON outlook_accounts(status);
@@ -96,6 +100,24 @@ def init_db():
             error           TEXT,
             error_category  TEXT         -- network / account / unknown
         );
+
+        -- 推送目标：取代原来三个写死的导出槽位。
+        -- 每次注册成功按 weight 随机选一个 enabled 目标推送，默认全为 1 即 1:1。
+        CREATE TABLE IF NOT EXISTS push_targets (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            name            TEXT NOT NULL,
+            type            TEXT NOT NULL,   -- cpa / sub2api / chatgpt2api / chat2api_go
+            url             TEXT NOT NULL,
+            credential      TEXT,            -- 管理密钥；chat2api_go 用 X-Admin-Token
+            group_id        TEXT,
+            weight          INTEGER NOT NULL DEFAULT 1,
+            enabled         INTEGER NOT NULL DEFAULT 1,
+            timeout         INTEGER NOT NULL DEFAULT 15,
+            fail_count      INTEGER NOT NULL DEFAULT 0,
+            last_error      TEXT,
+            created_at      REAL,
+            updated_at      REAL
+        );
     """)
     con.commit()
     # 老 DB migrate：error_category 在后期才加，对已建表补列
@@ -117,6 +139,14 @@ def init_db():
         con.commit()
     if "relay_url" not in acc_cols:
         con.execute("ALTER TABLE outlook_accounts ADD COLUMN relay_url TEXT")
+        con.commit()
+    # 老 DB migrate：重试计数（毒邮箱熔断用）。SQLite/MySQL/Postgres 都支持
+    # 带默认值的 ADD COLUMN；存量行补 0 而不是补历史次数是有意为之 ——
+    # 历史次数无从还原，把存量号当「全新」放行一次比误熔断安全。
+    if "attempts" not in acc_cols:
+        con.execute(
+            "ALTER TABLE outlook_accounts ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+        )
         con.commit()
     # 索引建在补列之后，否则老库上 CREATE INDEX 会因为没有 kind 列而失败
     con.execute(
@@ -299,7 +329,10 @@ def claim_next(kind: str = "") -> Optional[dict]:
     """原子 claim 任一 available 号。
 
     kind 指定 → 只从该类型里挑（"选了 gmail 就只跑 gmail 号"）
-    kind 为空 → 全池子里挑最早导入的
+    kind 为空 → 全池子里挑最新导入的
+
+    新号优先（ORDER BY imported_at DESC）：刚导入的号最新鲜。
+    单事务领取，避免 100 worker 把 claim 打成误报空池。
 
     多类型混放的关键就在这里：号池里 outlook 和 gmail 并存，
     但当前配置选了哪种，就只 claim 哪种，不会串。
@@ -307,41 +340,68 @@ def claim_next(kind: str = "") -> Optional[dict]:
     k = (kind or "").strip().lower()
     with _lock:
         con = _conn()
-        for _ in range(50):  # 有限重试，避免并发抢号时无限递归爆栈
+        con.execute("BEGIN IMMEDIATE")
+        try:
             if k:
                 cur = con.execute(
                     "SELECT * FROM outlook_accounts WHERE status='available' AND kind=? "
-                    "ORDER BY imported_at ASC LIMIT 1",
+                    "ORDER BY imported_at DESC, rowid DESC LIMIT 1",
                     (k,),
                 )
             else:
                 cur = con.execute(
                     "SELECT * FROM outlook_accounts WHERE status='available' "
-                    "ORDER BY imported_at ASC LIMIT 1"
+                    "ORDER BY imported_at DESC, rowid DESC LIMIT 1"
                 )
             row = cur.fetchone()
             if not row:
+                con.commit()
                 return None
             rc = con.execute(
                 "UPDATE outlook_accounts SET status='in_use', claimed_at=? "
                 "WHERE email=? AND status='available'",
                 (time.time(), row["email"]),
             )
+            if rc.rowcount != 1:
+                con.rollback()
+                return None
             con.commit()
-            if rc.rowcount == 1:
-                return dict(row)
-            # 被别的线程抢走了，换下一个再试
-        return None
+            return dict(row)
+        except Exception:
+            con.rollback()
+            raise
 
 
 def mark_done(email: str) -> None:
     with _lock:
         con = _conn()
         con.execute(
-            "UPDATE outlook_accounts SET status='done', finished_at=?, fail_reason=NULL WHERE email=?",
+            "UPDATE outlook_accounts SET status='done', finished_at=?, fail_reason=NULL, "
+            "attempts=0 WHERE email=?",
             (time.time(), email.lower()),
         )
         con.commit()
+
+
+def bump_attempts(email: str) -> int:
+    """该邮箱尝试次数 +1，返回累加后的值（行不存在时返回 0）。
+
+    调用方用它做毒邮箱熔断：连续失败到上限就 mark_failed，
+    不再 release 回池 —— 否则一个 409 死号能被无限重试（实测有号被跑 33 次）。
+    """
+    with _lock:
+        con = _conn()
+        con.execute(
+            "UPDATE outlook_accounts SET attempts=COALESCE(attempts, 0) + 1 "
+            "WHERE lower(email)=lower(?)",
+            (email.lower(),),
+        )
+        con.commit()
+        row = con.execute(
+            "SELECT attempts FROM outlook_accounts WHERE lower(email)=lower(?)",
+            (email.lower(),),
+        ).fetchone()
+        return int(row["attempts"] or 0) if row else 0
 
 
 def mark_failed(email: str, reason: str = "") -> None:
@@ -375,7 +435,7 @@ def reset_to_available(email: str) -> bool:
         con = _conn()
         rc = con.execute(
             "UPDATE outlook_accounts SET status='available', claimed_at=NULL, "
-            "finished_at=NULL, fail_reason=NULL "
+            "finished_at=NULL, fail_reason=NULL, attempts=0 "
             "WHERE lower(email)=lower(?)",
             (email,),
         )
@@ -391,7 +451,7 @@ def bulk_reset_to_available(emails: list[str]) -> int:
         con = _conn()
         rc = con.execute(
             f"UPDATE outlook_accounts SET status='available', claimed_at=NULL, "
-            f"finished_at=NULL, fail_reason=NULL "
+            f"finished_at=NULL, fail_reason=NULL, attempts=0 "
             f"WHERE lower(email) IN ({','.join(['lower(?)'] * len(emails))})",
             emails,
         )
@@ -408,7 +468,7 @@ def reset_failed_to_available() -> int:
         con = _conn()
         rc = con.execute(
             "UPDATE outlook_accounts SET status='available', fail_reason=NULL, "
-            "finished_at=NULL WHERE status='failed'"
+            "finished_at=NULL, attempts=0 WHERE status='failed'"
         )
         con.commit()
         return rc.rowcount
@@ -1123,14 +1183,14 @@ def get_sms_internal_config() -> dict:
     }
 
 
-# ──────────────────────── 自动导出配置 (CPA / SUB2API) ────────────────────────
+# ──────────────────────── 自动导出配置 (CPA / SUB2API / ChatGPT2API) ────────────────────────
 
 
 def get_export_config() -> dict:
     """返回导出配置（敏感字段做明文/'***' 占位）。
 
     给前端展示用：
-      cpa_mgmt_key / sub2api_api_key 已设置时返回 '***'，未设置返回 ''。
+      cpa_mgmt_key / sub2api_api_key / chatgpt2api_admin_key 已设置时返回 '***'，未设置返回 ''。
       保存时传 '***' 代表不修改。
     """
     return {
@@ -1145,6 +1205,13 @@ def get_export_config() -> dict:
         "sub2api_api_key":    "***" if get_setting("export_sub2api_api_key") else "",
         "sub2api_group_ids":  get_setting("export_sub2api_group_ids", "2"),
         "sub2api_timeout":    get_setting("export_sub2api_timeout", "30"),
+        # ChatGPT2API
+        "chatgpt2api_enabled": get_setting("export_chatgpt2api_enabled", "0"),
+        "chatgpt2api_url": get_setting("export_chatgpt2api_url", ""),
+        "chatgpt2api_admin_key": "***" if get_setting("export_chatgpt2api_admin_key") else "",
+        "chatgpt2api_target_group_id": get_setting("export_chatgpt2api_target_group_id", ""),
+        "chatgpt2api_sync_after_import": get_setting("export_chatgpt2api_sync_after_import", "1"),
+        "chatgpt2api_timeout": get_setting("export_chatgpt2api_timeout", "60"),
     }
 
 
@@ -1154,6 +1221,7 @@ def save_export_config(data: dict) -> None:
     for key_in, key_out in (
         ("cpa_enabled",     "export_cpa_enabled"),
         ("sub2api_enabled", "export_sub2api_enabled"),
+        ("chatgpt2api_enabled", "export_chatgpt2api_enabled"),
     ):
         if key_in in data:
             v = data[key_in]
@@ -1169,6 +1237,10 @@ def save_export_config(data: dict) -> None:
         ("sub2api_url",        "export_sub2api_url"),
         ("sub2api_group_ids",  "export_sub2api_group_ids"),
         ("sub2api_timeout",    "export_sub2api_timeout"),
+        ("chatgpt2api_url", "export_chatgpt2api_url"),
+        ("chatgpt2api_target_group_id", "export_chatgpt2api_target_group_id"),
+        ("chatgpt2api_sync_after_import", "export_chatgpt2api_sync_after_import"),
+        ("chatgpt2api_timeout", "export_chatgpt2api_timeout"),
     ):
         if key_in in data:
             set_setting(key_out, str(data[key_in] or "").strip())
@@ -1177,6 +1249,8 @@ def save_export_config(data: dict) -> None:
         set_setting("export_cpa_mgmt_key", str(data["cpa_mgmt_key"]).strip())
     if data.get("sub2api_api_key") and data["sub2api_api_key"] != "***":
         set_setting("export_sub2api_api_key", str(data["sub2api_api_key"]).strip())
+    if data.get("chatgpt2api_admin_key") and data["chatgpt2api_admin_key"] != "***":
+        set_setting("export_chatgpt2api_admin_key", str(data["chatgpt2api_admin_key"]).strip())
 
 
 def get_export_internal_config() -> dict:
@@ -1197,8 +1271,281 @@ def get_export_internal_config() -> dict:
         "sub2api_group_ids":  get_setting("export_sub2api_group_ids", "2"),
         "sub2api_timeout":    get_setting("export_sub2api_timeout", "30"),
     }
-    return {"cpa": cpa, "sub2api": sub2api}
+    chatgpt2api = {
+        "enabled": get_setting("export_chatgpt2api_enabled", "0") in ("1", "true"),
+        "chatgpt2api_url": get_setting("export_chatgpt2api_url", ""),
+        "chatgpt2api_admin_key": get_setting("export_chatgpt2api_admin_key", ""),
+        "chatgpt2api_target_group_id": get_setting("export_chatgpt2api_target_group_id", ""),
+        "chatgpt2api_sync_after_import": get_setting("export_chatgpt2api_sync_after_import", "1"),
+        "chatgpt2api_timeout": get_setting("export_chatgpt2api_timeout", "60"),
+    }
+    return {"cpa": cpa, "sub2api": sub2api, "chatgpt2api": chatgpt2api}
+
+
+# ──────────────────────── 推送目标（push_targets） ────────────────────────
+
+PUSH_TARGET_TYPES = ("cpa", "sub2api", "chatgpt2api", "chat2api_go")
+PUSH_TARGET_TYPE_LABELS = {
+    "cpa": "CPA",
+    "sub2api": "SUB2API",
+    "chatgpt2api": "ChatGPT2API(Python)",
+    "chat2api_go": "chat2api-Go",
+}
+_MIGRATION_KEY = "push_targets_migrated_v2"
+
+
+def _target_row(row: sqlite3.Row) -> dict:
+    item = dict(row)
+    item["weight"] = int(item.get("weight") or 1)
+    item["enabled"] = bool(item.get("enabled"))
+    item["timeout"] = int(item.get("timeout") or 15)
+    item["fail_count"] = int(item.get("fail_count") or 0)
+    return item
+
+
+def list_push_targets(*, include_disabled: bool = True) -> list[dict]:
+    con = _conn()
+    try:
+        sql = "SELECT * FROM push_targets"
+        if not include_disabled:
+            sql += " WHERE enabled = 1"
+        sql += " ORDER BY id"
+        return [_target_row(r) for r in con.execute(sql).fetchall()]
+    finally:
+        con.close()
+
+
+def get_push_target(target_id: int) -> Optional[dict]:
+    con = _conn()
+    try:
+        row = con.execute("SELECT * FROM push_targets WHERE id=?", (int(target_id),)).fetchone()
+        return _target_row(row) if row else None
+    finally:
+        con.close()
+
+
+def create_push_target(data: dict) -> int:
+    now = time.time()
+    kind = str(data.get("type") or "").strip()
+    if kind not in PUSH_TARGET_TYPES:
+        raise ValueError(f"unsupported target type: {kind}")
+    con = _conn()
+    try:
+        with _lock:
+            cur = con.execute(
+                "INSERT INTO push_targets"
+                "(name, type, url, credential, group_id, weight, enabled, timeout,"
+                " fail_count, last_error, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,0,NULL,?,?)",
+                (
+                    str(data.get("name") or kind).strip() or kind,
+                    kind,
+                    str(data.get("url") or "").strip(),
+                    str(data.get("credential") or "").strip(),
+                    str(data.get("group_id") or "").strip(),
+                    max(1, int(data.get("weight") or 1)),
+                    1 if data.get("enabled", True) else 0,
+                    max(1, int(data.get("timeout") or 15)),
+                    now,
+                    now,
+                ),
+            )
+            con.commit()
+            return int(cur.lastrowid)
+    finally:
+        con.close()
+
+
+def update_push_target(target_id: int, data: dict) -> bool:
+    fields: list[str] = []
+    params: list = []
+    for key, coerce in (
+        ("name", lambda v: str(v or "").strip()),
+        ("type", lambda v: str(v or "").strip()),
+        ("url", lambda v: str(v or "").strip()),
+        ("credential", lambda v: str(v or "").strip()),
+        ("group_id", lambda v: str(v or "").strip()),
+        ("weight", lambda v: max(1, int(v or 1))),
+        ("enabled", lambda v: 1 if v else 0),
+        ("timeout", lambda v: max(1, int(v or 15))),
+    ):
+        if key not in data:
+            continue
+        value = coerce(data[key])
+        if key == "type" and value not in PUSH_TARGET_TYPES:
+            raise ValueError(f"unsupported target type: {value}")
+        # 密文字段传 '***' 表示「不修改」，与既有导出配置的约定一致
+        if key == "credential" and value == "***":
+            continue
+        fields.append(f"{key}=?")
+        params.append(value)
+    if not fields:
+        return False
+    fields.append("updated_at=?")
+    params.append(time.time())
+    params.append(int(target_id))
+    con = _conn()
+    try:
+        with _lock:
+            cur = con.execute(
+                f"UPDATE push_targets SET {', '.join(fields)} WHERE id=?", params
+            )
+            con.commit()
+            return cur.rowcount > 0
+    finally:
+        con.close()
+
+
+def delete_push_target(target_id: int) -> bool:
+    con = _conn()
+    try:
+        with _lock:
+            cur = con.execute("DELETE FROM push_targets WHERE id=?", (int(target_id),))
+            con.commit()
+            return cur.rowcount > 0
+    finally:
+        con.close()
+
+
+def record_push_result(target_id: int, ok: bool, message: str = "") -> None:
+    """记录一次推送结果。失败累加 fail_count，便于前端看出哪个目标在坏。"""
+    con = _conn()
+    try:
+        with _lock:
+            if ok:
+                con.execute(
+                    "UPDATE push_targets SET fail_count=0, last_error=NULL, updated_at=? WHERE id=?",
+                    (time.time(), int(target_id)),
+                )
+            else:
+                con.execute(
+                    "UPDATE push_targets SET fail_count=fail_count+1, last_error=?, updated_at=? WHERE id=?",
+                    (str(message or "")[:500], time.time(), int(target_id)),
+                )
+            con.commit()
+    finally:
+        con.close()
+
+
+def pick_push_target() -> Optional[dict]:
+    """按权重随机挑一个启用中的目标。
+
+    权重是「相对比例」而不是绝对配额：全为 1 即 1:1，配 3:1 即 75%/25%。
+    用整数权重逐个累加后取随机点，避免浮点误差。
+    """
+    targets = [t for t in list_push_targets(include_disabled=False) if t["weight"] > 0]
+    if not targets:
+        return None
+    total = sum(t["weight"] for t in targets)
+    point = random.uniform(0, total)
+    cursor = 0.0
+    for target in targets:
+        cursor += target["weight"]
+        if point <= cursor:
+            return target
+    return targets[-1]
+
+
+def mark_registered_push(email: str, payload: dict) -> None:
+    """把推送结果写进 registered.extra_json.push（不改表结构）。"""
+    con = _conn()
+    try:
+        with _lock:
+            row = con.execute("SELECT extra_json FROM registered WHERE email=?", (email,)).fetchone()
+            if not row:
+                return
+            try:
+                extra = json.loads(row["extra_json"] or "{}")
+                if not isinstance(extra, dict):
+                    extra = {}
+            except (TypeError, ValueError):
+                extra = {}
+            extra["push"] = payload
+            con.execute(
+                "UPDATE registered SET extra_json=? WHERE email=?",
+                (json.dumps(extra, ensure_ascii=False), email),
+            )
+            con.commit()
+    finally:
+        con.close()
+
+
+def list_registered_push_pending(limit: int = 50) -> list[dict]:
+    """列出推送失败或从未推送过的已注册账号。
+
+    判据放在 SQL 里做粗筛（extra_json 不含 '"push"'），再用 Python 精确判定，
+    避免 SQLite JSON1 不一定可用的问题。
+    """
+    con = _conn()
+    try:
+        rows = con.execute(
+            "SELECT * FROM registered ORDER BY created_at DESC LIMIT ?",
+            (max(1, int(limit)) * 5,),
+        ).fetchall()
+    finally:
+        con.close()
+    pending: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            extra = json.loads(item.get("extra_json") or "{}")
+        except (TypeError, ValueError):
+            extra = {}
+        push = extra.get("push") if isinstance(extra, dict) else None
+        if isinstance(push, dict) and push.get("ok"):
+            continue
+        pending.append(item)
+        if len(pending) >= limit:
+            break
+    return pending
+
+
+def migrate_legacy_export_targets() -> int:
+    """把旧的三个固定槽位一次性转成 push_targets 记录。
+
+    旧键保留不删：回滚到旧版本时仍能读到原配置。迁移只跑一次，
+    靠 settings 里的 push_targets_migrated_v2 标记。
+    """
+    if get_setting(_MIGRATION_KEY, "") == "1":
+        return 0
+    created = 0
+    legacy = (
+        ("cpa", "CPA(迁移)", "export_cpa_enabled", "export_cpa_url",
+         "export_cpa_mgmt_key", "", "export_cpa_timeout"),
+        ("sub2api", "SUB2API(迁移)", "export_sub2api_enabled", "export_sub2api_url",
+         "export_sub2api_api_key", "export_sub2api_group_ids", "export_sub2api_timeout"),
+        ("chatgpt2api", "ChatGPT2API(迁移)", "export_chatgpt2api_enabled",
+         "export_chatgpt2api_url", "export_chatgpt2api_admin_key",
+         "export_chatgpt2api_target_group_id", "export_chatgpt2api_timeout"),
+    )
+    for kind, name, enabled_key, url_key, cred_key, group_key, timeout_key in legacy:
+        if get_setting(enabled_key, "0") not in ("1", "true"):
+            continue
+        url = get_setting(url_key, "")
+        if not url:
+            continue
+        try:
+            create_push_target({
+                "name": name,
+                "type": kind,
+                "url": url,
+                "credential": get_setting(cred_key, ""),
+                "group_id": get_setting(group_key, "") if group_key else "",
+                "weight": 1,
+                "enabled": True,
+                "timeout": get_setting(timeout_key, "15") or 15,
+            })
+            created += 1
+        except (ValueError, TypeError):
+            continue
+    set_setting(_MIGRATION_KEY, "1")
+    return created
 
 
 # 模块加载时自动建表
 init_db()
+# 旧的三槽位配置一次性搬进 push_targets（幂等，靠 settings 标记）
+try:
+    migrate_legacy_export_targets()
+except Exception:  # 迁移失败不能阻断进程启动
+    pass

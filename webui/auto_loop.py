@@ -15,18 +15,55 @@ import logging
 import queue
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from . import db, registrar
 from mail_providers import MailProviderError, get_provider_class
 
 logger = logging.getLogger("auto_loop")
 
+try:
+    from proxy_pool import (
+        DynamicProxyError,
+        dynamic_proxy_enabled,
+        finish_proxy_run,
+        reset_proxy_balance_session,
+        resolve_for_run,
+        rotate_cell_proxy,
+        run_slot_index,
+    )
+except ImportError:
+    dynamic_proxy_enabled = None  # type: ignore
+    resolve_for_run = None  # type: ignore
+    run_slot_index = None  # type: ignore
+    finish_proxy_run = None  # type: ignore
+    rotate_cell_proxy = None  # type: ignore
+    reset_proxy_balance_session = None  # type: ignore
+
+    class DynamicProxyError(RuntimeError):
+        pass
+
 
 class AutoLoopState:
     STOPPED = "stopped"
     RUNNING = "running"
     PAUSED = "paused"
+
+
+# 账密被拒 / 欠费不会在 45–90s 内自愈；这类错误自动恢复只会空转熔断。
+_FATAL_PROXY_ENV_HINTS = (
+    "curl: (97)",
+    "user was rejected by the socks5",
+    "response 402",
+    "connect tunnel failed, response 402",
+    "需要提取的ip数量为0",
+    "需要提取的ip数量为 0",
+)
+
+
+def _is_fatal_proxy_env(err: str) -> bool:
+    s = (err or "").lower()
+    return any(h in s for h in _FATAL_PROXY_ENV_HINTS)
 
 
 def _parse_proxy_pool(text: str) -> list[str]:
@@ -45,7 +82,7 @@ class AutoLoopController:
     options 关键字段：
       proxy:                单代理（兼容旧版，concurrency=1 时用）
       proxy_pool:           多代理字符串（每行一个；多 worker 会按 worker index 轮流取）
-      concurrency:          并发 worker 数（1-20）
+      concurrency:          并发 worker 数（1-100，受 VPS/上游限流约束）
       cool_down_seconds:    每个 worker 跑完后冷却时间（默认 3）
       其余参数透传给 registrar.start_registration
     """
@@ -67,7 +104,9 @@ class AutoLoopController:
         self._last_message = ""
         # 熔断状态
         self._consecutive_network_fails = 0
+        self._consecutive_otp_fails = 0
         self._circuit_break_threshold = 3
+        self._otp_circuit_break_threshold = 8
         self._last_break_reason = ""
         # SSE 订阅
         self._subscribers: list[queue.Queue] = []
@@ -76,13 +115,26 @@ class AutoLoopController:
         self._concurrency: int = 1
         # 目标成功数：0 = 不限量（保持旧行为）；>0 时累计成功达标即自动停止
         self._target_count: int = 0
+        self._auto_resume_timer: Optional[threading.Timer] = None
 
     # ──────────────────────── 公共 API ────────────────────────
 
     def start(self, options: dict) -> dict:
+        manage_to_join: Optional[threading.Thread] = None
         with self._lock:
             if self._state in (AutoLoopState.RUNNING, AutoLoopState.PAUSED):
-                return {"ok": False, "error": f"已经在跑了 (state={self._state})"}
+                # 点「开始」= 新批次：先停掉熔断/暂停中的旧会话（避免卡 paused 无法启动）
+                self._stop_event.set()
+                self._pause_event.clear()
+                self._cancel_auto_resume_timer()
+                manage_to_join = self._manage_thread
+        if manage_to_join is not None and manage_to_join.is_alive():
+            manage_to_join.join(timeout=90)
+        with self._lock:
+            if self._state != AutoLoopState.STOPPED:
+                self._state = AutoLoopState.STOPPED
+                self._worker_status.clear()
+                self._last_message = "上一会话已结束，准备新批次"
             # 重置
             self._stop_event.clear()
             self._pause_event.clear()
@@ -93,13 +145,34 @@ class AutoLoopController:
             self._registered_fail = 0
             self._worker_status.clear()
             self._consecutive_network_fails = 0
+            self._consecutive_otp_fails = 0
+            self._cancel_auto_resume_timer()
             self._last_message = "auto-loop 启动"
+            if reset_proxy_balance_session is not None:
+                reset_proxy_balance_session()
+            try:
+                from mail_otp_limit import configure as configure_otp_limit
+
+                configure_otp_limit(
+                    per_domain=int(self._options.get("mail_otp_per_domain") or 4),
+                )
+            except ImportError:
+                pass
             # 解析并发参数
-            self._concurrency = max(1, min(20, int(self._options.get("concurrency") or 1)))
+            self._concurrency = max(1, min(100, int(self._options.get("concurrency") or 1)))
+            self._otp_circuit_break_threshold = max(
+                3,
+                int(self._options.get("otp_circuit_break_threshold") or 8),
+            )
             pool_text = self._options.get("proxy_pool") or ""
             self._proxy_pool = _parse_proxy_pool(pool_text)
             # 目标成功数（0=不限量）
             self._target_count = max(0, int(self._options.get("target_count") or 0))
+            default_break = 6 if self._dynamic_proxy_enabled() else 3
+            self._circuit_break_threshold = max(
+                1,
+                int(self._options.get("circuit_break_threshold") or default_break),
+            )
             # 启 manage 线程
             self._manage_thread = threading.Thread(
                 target=self._manage_loop, daemon=True, name="auto-loop-manage"
@@ -140,9 +213,19 @@ class AutoLoopController:
                 return {"ok": False, "error": "没在跑"}
             self._stop_event.set()
             self._pause_event.clear()
+            self._cancel_auto_resume_timer()
             self._last_message = "已请求停止（当前 worker 跑完才生效）"
         self._broadcast("state", self._snapshot())
         return {"ok": True}
+
+    def _cancel_auto_resume_timer(self) -> None:
+        t = self._auto_resume_timer
+        self._auto_resume_timer = None
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
 
     def status(self) -> dict:
         return self._snapshot()
@@ -173,10 +256,18 @@ class AutoLoopController:
                     "email": info.get("email", ""),
                     "run_id": info.get("run_id", ""),
                     "proxy": info.get("proxy", ""),
+                    "proxy_label": info.get("proxy_label", ""),
                     "started_at": info.get("started_at", 0),
                 }
                 for wid, info in sorted(self._worker_status.items())
             ]
+            proxy_balance = {}
+            try:
+                from proxy_balance import get_balancer
+
+                proxy_balance = get_balancer().snapshot_stats()
+            except ImportError:
+                pass
             return {
                 "state": self._state,
                 "started_at": self._started_at,
@@ -193,6 +284,7 @@ class AutoLoopController:
                 "workers": workers_info,
                 "last_message": self._last_message,
                 "pool_stats": stats,
+                "proxy_balance": proxy_balance,
             }
 
     def _broadcast(self, kind: str, data):
@@ -209,13 +301,48 @@ class AutoLoopController:
             self._last_message = msg
         self._broadcast("state", self._snapshot())
 
+    def _dynamic_proxy_enabled(self) -> bool:
+        if dynamic_proxy_enabled is not None:
+            return dynamic_proxy_enabled(self._options)
+        return bool(
+            self._options.get("zooproxy_enabled") or self._options.get("ipwo_enabled")
+        )
+
     def _proxy_for_worker(self, worker_id: int) -> str:
-        """按 worker_id 从代理池里挑一个代理。空池时回退到 options.proxy。"""
+        """静态池：按 worker 固定一条；动态代理在每次开 run 时再拉新 IP + 国家。"""
+        if self._dynamic_proxy_enabled():
+            return ""
         if self._proxy_pool:
             return self._proxy_pool[worker_id % len(self._proxy_pool)]
         return self._options.get("proxy", "") or ""
 
-    def _record_finish(self, ok: bool, category: str):
+    @staticmethod
+    def _static_proxy_label(proxy: str) -> str:
+        p = (proxy or "").strip()
+        if not p:
+            return "直连"
+        if "@" in p:
+            return p.split("@", 1)[-1][:56]
+        return p[:56]
+
+    def _proxy_for_run(self, worker_id: int, static_proxy: str) -> tuple[str, str, Any]:
+        if not self._dynamic_proxy_enabled():
+            p = static_proxy or ""
+            return p, self._static_proxy_label(p), None
+        if resolve_for_run is None or run_slot_index is None:
+            raise DynamicProxyError("proxy_pool 模块未加载")
+        with self._lock:
+            slot = run_slot_index(
+                worker_id=worker_id,
+                registered_ok=self._registered_ok,
+                registered_fail=self._registered_fail,
+            )
+        proxy, label, cell = resolve_for_run(
+            self._options, worker_id=worker_id, run_slot=slot
+        )
+        return proxy, label, cell
+
+    def _record_finish(self, ok: bool, category: str, err: str = ""):
         """worker 结束一个 run 后调，更新计数 + 熔断。"""
         with self._lock:
             if ok:
@@ -251,17 +378,54 @@ class AutoLoopController:
             return
 
         if trigger_break:
+            fatal = _is_fatal_proxy_env(err)
             with self._lock:
                 self._pause_event.set()
                 self._state = AutoLoopState.PAUSED
-                self._last_break_reason = (
-                    f"连续 {self._consecutive_network_fails} 次网络/环境错误，"
-                    f"自动暂停（号已自动 release，请检查代理后点恢复）"
-                )
+                n = self._consecutive_network_fails
+                if fatal:
+                    self._last_break_reason = (
+                        f"连续 {n} 次代理鉴权/欠费错误，已暂停且不自动恢复"
+                        f"（{str(err or '')[:120]}）"
+                    )
+                else:
+                    self._last_break_reason = (
+                        f"连续 {n} 次网络/环境错误，"
+                        f"自动暂停（号已自动 release，请检查代理后点恢复）"
+                    )
                 self._last_message = self._last_break_reason
                 self._consecutive_network_fails = 0
+                auto_resume = bool(self._options.get("auto_resume_on_network", True)) and not fatal
+                delay = float(self._options.get("auto_resume_delay_seconds") or 45)
             logger.warning(self._last_break_reason)
             self._broadcast("circuit_break", {"reason": self._last_break_reason})
+            if auto_resume and delay > 0:
+                self._schedule_auto_resume(delay)
+
+    def _schedule_auto_resume(self, delay: float) -> None:
+        self._cancel_auto_resume_timer()
+
+        def _fire():
+            with self._lock:
+                if self._stop_event.is_set():
+                    return
+                if self._state != AutoLoopState.PAUSED:
+                    return
+                self._pause_event.clear()
+                self._state = AutoLoopState.RUNNING
+                self._last_message = (
+                    f"网络熔断后 {int(delay)}s 自动恢复（可手动停止）"
+                )
+            logger.info(self._last_message)
+            self._broadcast("state", self._snapshot())
+
+        t = threading.Timer(delay, _fire)
+        t.daemon = True
+        self._auto_resume_timer = t
+        t.start()
+        self._set_message(
+            f"{self._last_break_reason}；约 {int(delay)}s 后自动恢复"
+        )
 
     def _manage_loop(self):
         """主控线程：启动 worker，等所有 worker 结束，更新最终状态。"""
@@ -274,8 +438,8 @@ class AutoLoopController:
                 )
                 t.start()
                 workers.append(t)
-                # 每个 worker 之间错开 1s 启动，避免同时打 OpenAI
-                time.sleep(1.0)
+                # 高并发下 1s 错开会让 100 worker 冷启动超过 1.5 分钟
+                time.sleep(0.12)
             self._workers = workers
             # 等所有 worker 退出
             for t in workers:
@@ -338,18 +502,17 @@ class AutoLoopController:
                              f"{int(time.time())}_{worker_id}@placeholder.local",
                     "password": "", "client_id": "", "refresh_token": "",
                     "relay_url": "", "kind": mail_source,
+                    # CF 多域：同一 worker 固定用一个域，并发间分散声誉/限流
+                    "cf_domain_index": worker_id,
                 }
             if not account:
                 idle_round += 1
                 if idle_round == 1:
                     self._set_message(
-                        f"worker-{worker_id} 号池空，等待新号..."
+                        f"worker-{worker_id} 号池空，挂起等待新号（不退出）"
                     )
-                # 空 10 轮（约 30s）就停掉这个 worker
-                if idle_round >= 10:
-                    logger.info(f"[worker-{worker_id}] 号池空 30s，停止")
-                    return
-                # 等 3s 再试
+                    logger.info(f"[worker-{worker_id}] 号池空，挂起等待新号")
+                # 等 3s 再试；不要因短暂空池/claim 争用把 worker 杀掉
                 for _ in range(30):
                     if self._stop_event.is_set() or self._pause_event.is_set():
                         break
@@ -357,16 +520,45 @@ class AutoLoopController:
                 continue
             idle_round = 0
 
-            # 给这个 run 注入 worker 自己的代理
+            # 给这个 run 注入代理（ZooProxy：每个号拉一条新 IP）
             run_options = dict(self._options)
-            if proxy:
-                run_options["proxy"] = proxy
+            proxy_cell = None
+            try:
+                run_proxy, proxy_label, proxy_cell = self._proxy_for_run(worker_id, proxy)
+            except DynamicProxyError as e:
+                logger.error(f"[worker-{worker_id}] 动态代理提取失败: {e}")
+                if pooled:
+                    db.release_unused(account["email"])
+                self._record_finish(False, "network", err=str(e))
+                idle_wait = float(self._options.get("zooproxy_fail_sleep") or 15)
+                for _ in range(int(idle_wait * 10)):
+                    if self._stop_event.is_set() or self._pause_event.is_set():
+                        break
+                    time.sleep(0.1)
+                continue
+            if run_proxy:
+                run_options["proxy"] = run_proxy
+                if proxy_cell is not None:
+                    # warmup 拿不到 oai-did 时换一条新出口 IP（同格换 sid），
+                    # 而不是拿同一个粘性坏 IP 反复重试。默认参数绑定格子，
+                    # 避免闭包捕获到下一轮循环的 proxy_cell。
+                    run_options["proxy_rotate"] = (
+                        lambda cell=proxy_cell: rotate_cell_proxy(self._options, cell)
+                    )
 
             # 启一个 run
             try:
                 run_id = registrar.start_registration(account, run_options)
             except Exception as e:
                 logger.exception(f"[worker-{worker_id}] 启动注册失败: {e}")
+                if finish_proxy_run is not None and proxy_cell is not None:
+                    finish_proxy_run(
+                        proxy_cell,
+                        proxy_label=proxy_label,
+                        ok=False,
+                        err=str(e),
+                    )
+                    proxy_cell = None
                 if pooled:
                     db.release_unused(account["email"])
                 time.sleep(2)
@@ -376,7 +568,9 @@ class AutoLoopController:
                 self._worker_status[worker_id] = {
                     "email": account["email"],
                     "run_id": run_id,
-                    "proxy": proxy,
+                    "proxy": run_proxy,
+                    "proxy_label": proxy_label,
+                    "proxy_cell": proxy_cell,
                     "started_at": time.time(),
                 }
             self._broadcast("state", self._snapshot())
@@ -384,15 +578,28 @@ class AutoLoopController:
                 "worker_id": worker_id,
                 "email": account["email"],
                 "run_id": run_id,
-                "proxy": proxy,
+                "proxy": run_proxy,
+                "proxy_label": proxy_label,
             })
 
-            # 等当前 run 跑完
-            ok, category = self._wait_run_finish(run_id)
+            ok, category, err_text = self._wait_run_finish(run_id)
 
             with self._lock:
-                self._worker_status.pop(worker_id, None)
-            self._record_finish(ok, category)
+                winfo = self._worker_status.pop(worker_id, {})
+            if finish_proxy_run is not None:
+                finish_proxy_run(
+                    winfo.get("proxy_cell"),
+                    proxy_label=winfo.get("proxy_label") or proxy_label,
+                    ok=ok,
+                    err=err_text or "",
+                )
+            self._record_finish(ok, category, err=err_text or "")
+            err_l = (err_text or "").lower()
+            if not ok and ("otp timeout" in err_l or "otp slot wait" in err_l):
+                self._on_otp_fail(err_text)
+            elif ok:
+                with self._lock:
+                    self._consecutive_otp_fails = 0
             self._broadcast("state", self._snapshot())
             self._broadcast("run_finished", {
                 "worker_id": worker_id,
@@ -410,26 +617,53 @@ class AutoLoopController:
                         break
                     time.sleep(0.1)
 
-    def _wait_run_finish(self, run_id: str, timeout: int = 1800) -> tuple[bool, str]:
+    def _on_otp_fail(self, err_text: str) -> None:
+        trigger = False
+        with self._lock:
+            self._consecutive_otp_fails += 1
+            if (
+                self._consecutive_otp_fails >= self._otp_circuit_break_threshold
+                and self._state == AutoLoopState.RUNNING
+            ):
+                trigger = True
+        if not trigger:
+            return
+        delay = float(self._options.get("otp_circuit_resume_seconds") or 120)
+        with self._lock:
+            self._pause_event.set()
+            self._state = AutoLoopState.PAUSED
+            self._last_break_reason = (
+                f"连续 {self._consecutive_otp_fails} 次 OTP/收信超时，"
+                f"邮件层可能饱和，自动暂停 {int(delay)}s"
+            )
+            self._last_message = self._last_break_reason
+            self._consecutive_otp_fails = 0
+        logger.warning("%s (%s)", self._last_break_reason, err_text[:80])
+        self._broadcast("circuit_break", {"reason": self._last_break_reason, "kind": "otp"})
+        if bool(self._options.get("auto_resume_on_network", True)) and delay > 0:
+            self._schedule_auto_resume(delay)
+
+    def _wait_run_finish(self, run_id: str, timeout: int = 1800) -> tuple[bool, str, str]:
         """轮询 runs 表，等 run 跑完。"""
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self._stop_event.is_set():
-                return False, ""
+                return False, "", ""
             con = db._conn()
             cur = con.execute(
-                "SELECT status, error_category FROM runs WHERE run_id=?", (run_id,)
+                "SELECT status, error_category, error FROM runs WHERE run_id=?",
+                (run_id,),
             )
             row = cur.fetchone()
             if row:
                 st = row["status"]
                 if st == "done":
-                    return True, ""
+                    return True, "", ""
                 if st == "failed":
-                    return False, (row["error_category"] or "")
+                    return False, (row["error_category"] or ""), (row["error"] or "")
             time.sleep(1)
         logger.warning(f"run {run_id} 等了 {timeout}s 没结束，超时放弃")
-        return False, ""
+        return False, "", "run wait timeout"
 
 
 # 全局单例

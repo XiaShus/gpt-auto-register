@@ -3,15 +3,44 @@ import { computed, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useProxyStore, isValidProxy, proxyScheme } from '@/stores/proxy'
-import { testProxies } from '@/api/proxy'
+import { useFormStore } from '@/stores/form'
+import { testProxies, fetchZooproxy } from '@/api/proxy'
 import { copyText } from '@/api/request'
 
 const proxyStore = useProxyStore()
+const { form } = storeToRefs(useFormStore())
 const { list, count } = storeToRefs(proxyStore)
 
 const draft = ref('')
 const testResults = ref({}) // proxy -> { status:'testing'|'ok'|'fail', latency_ms, ip, error }
 const testingAll = ref(false)
+const zooTesting = ref(false)
+const zooLast = ref('')
+
+async function testZooproxy() {
+  const url = (form.value.zooproxyApiUrl || '').trim()
+  if (!url) {
+    ElMessage.warning('请先在全自动/单次页配置 ZooProxy API URL，或在此填写')
+    return
+  }
+  zooTesting.value = true
+  zooLast.value = ''
+  try {
+    const { ok, proxy, error } = await fetchZooproxy(url, form.value.zooproxyScheme || 'http')
+    if (!ok) {
+      ElMessage.error(error || '提取失败')
+      zooLast.value = error || '失败'
+      return
+    }
+    zooLast.value = proxy
+    ElMessage.success('提取成功: ' + proxy)
+  } catch (e) {
+    ElMessage.error(e.message)
+    zooLast.value = e.message
+  } finally {
+    zooTesting.value = false
+  }
+}
 
 const rows = computed(() =>
   list.value.map((p, i) => ({
@@ -72,6 +101,27 @@ function editInDraft() {
 <template>
   <div class="page">
     <el-row :gutter="16">
+      <el-col :span="24" style="margin-bottom: 16px">
+        <el-card shadow="never">
+          <template #header><span class="section-title" style="margin: 0">ZooProxy 动态住宅（白名单 API）</span></template>
+          <p class="hint">
+            在 <a href="https://console.zooproxy.com/traffic" target="_blank" rel="noopener">ZooProxy 控制台</a>
+            复制「使用链接」，并把 VPS 出口 IP 加入白名单。API 返回 JSON 时建议
+            <span class="mono">num=1</span>（每号一条 IP）。
+          </p>
+          <el-input v-model="form.zooproxyApiUrl" class="mono" placeholder="https://white.zooproxy.com/white/api?..." />
+          <div style="margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center">
+            <el-select v-model="form.zooproxyScheme" style="width: 140px">
+              <el-option label="http" value="http" />
+              <el-option label="https" value="https" />
+              <el-option label="socks5" value="socks5" />
+            </el-select>
+            <el-button type="primary" :loading="zooTesting" @click="testZooproxy">试拉一条 IP</el-button>
+            <el-button v-if="zooLast" size="small" @click="copyText(zooLast)">复制结果</el-button>
+          </div>
+          <p v-if="zooLast" class="hint mono" style="margin-top: 8px">{{ zooLast }}</p>
+        </el-card>
+      </el-col>
       <el-col :md="10" style="margin-bottom: 16px">
         <el-card shadow="never">
           <template #header><span class="section-title" style="margin: 0">批量导入</span></template>

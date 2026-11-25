@@ -7,6 +7,16 @@ const cryptoMod = require('node:crypto');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const sdkRaw = fs.readFileSync(process.env.OPENAI_SENTINEL_SDK_FILE, 'utf8');
 
+// 等待预算：全部可被调用方覆盖，未传时用下面的默认值。
+// init 默认 200ms 是实测结论，不是拍脑袋：SentinelSDK.init() 在本沙箱里
+// 从不 resolve，8s 预算等于每次白等满 8s 再走 getRequirementsToken() 兜底
+// （实测 30s 预算 → 30.08s；200ms 预算 → 0.26s，request_p 依然被
+// /sentinel/req 接受）。抬高它只会变慢，不会变好。
+const waitMs = (key, fallback) => {
+  const v = Number(input[key]);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+};
+
 const EXPOSE_PATCH = "return o?r?.[n(63)]?ce({so:o,c:r[n(63)]},t):o:null},t.token=ye,t}({});";
 const EXPOSE_REPLACEMENT =
   "return o?r?.[n(63)]?ce({so:o,c:r[n(63)]},t):o:null},t.token=ye,t.__debug_n=_n,t.__debug_bindProof=D,t}({});";
@@ -556,7 +566,7 @@ async function dispatchBehavior(durationMs) {
     try {
       await Promise.race([
         context.SentinelSDK.init(flow),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('init timeout')), 8000)),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('init timeout')), waitMs('init_timeout_ms', 200))),
       ]);
       if (capturedProof) {
         process.stdout.write(JSON.stringify({ request_p: capturedProof }));
@@ -574,7 +584,7 @@ async function dispatchBehavior(durationMs) {
     try {
       const mainToken = await Promise.race([
         context.SentinelSDK.token(flow),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('SDK token timeout')), 8000)),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('SDK token timeout')), waitMs('token_timeout_ms', 8000))),
       ]);
       if (mainToken) {
         await dispatchBehavior(behaviorMs);
@@ -582,7 +592,7 @@ async function dispatchBehavior(durationMs) {
         try {
           soToken = await Promise.race([
             context.SentinelSDK.sessionObserverToken(flow),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('SO timeout')), 5000)),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('SO timeout')), waitMs('so_timeout_ms', 5000))),
           ]);
         } catch (_) {
           soToken = '';

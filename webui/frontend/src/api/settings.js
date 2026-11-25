@@ -18,6 +18,14 @@ export const getSmsTopCountries = () => http.get('/api/settings/sms/countries')
 export const getSmsAllCountries = (provider = '') =>
   http.get('/api/settings/sms/all_countries', { params: { provider } })
 
+// ──────────────── 推送渠道（push_targets） ────────────────
+export const listPushTargets = () => http.get('/api/push-targets')
+export const createPushTarget = (payload) => http.post('/api/push-targets', payload)
+export const updatePushTarget = (id, payload) => http.put(`/api/push-targets/${id}`, payload)
+export const deletePushTarget = (id) => http.delete(`/api/push-targets/${id}`)
+export const testPushTarget = (id) => http.post(`/api/push-targets/${id}/test`)
+export const retryPendingPush = (payload) => http.post('/api/push-targets/retry', payload)
+
 // ──────────────── 自动导出配置 (CPA / SUB2API) ────────────────
 export const getExportConfig = () => http.get('/api/settings/export')
 export const saveExportConfig = (payload) => http.post('/api/settings/export', payload)

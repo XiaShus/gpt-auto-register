@@ -69,7 +69,7 @@ const routes = [
     path: '/settings/export',
     name: 'export',
     component: () => import('@/views/ExportConfig.vue'),
-    meta: { title: '自动导出', icon: 'Share', group: '配置' },
+    meta: { title: '推送渠道', icon: 'Share', group: '配置' },
   },
 ]
 

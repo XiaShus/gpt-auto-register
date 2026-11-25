@@ -27,6 +27,12 @@ sys.path.insert(0, str(ROOT))
 
 from . import db, export_formats, registrar  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
+from proxy_secrets import (  # noqa: E402
+    SECRETS_PATH,
+    apply_for_auto_loop,
+    apply_optimal_proxy_options,
+    preset_for_frontend,
+)
 from .exporter import _decode_jwt_payload, _get_auth  # noqa: E402
 from mail_providers import (  # noqa: E402
     ImportValidationError,
@@ -73,10 +79,30 @@ class RegisterReq(BaseModel):
     email: Optional[str] = Field(None, description="留空 = 自动 claim 下一个 available")
     want_access_token: bool = True
     want_session_token: bool = True
-    want_refresh_token: bool = True
+    want_refresh_token: bool = False
     proxy: str = ""
-    otp_timeout: int = 10
+    otp_timeout: int = 120
     allow_existing_login: bool = True
+    zooproxy_enabled: bool = False
+    zooproxy_mode: str = "gateway"
+    zooproxy_api_url: str = ""
+    zooproxy_scheme: str = "http"
+    zooproxy_gateway_host: str = "us-eu.zooproxy.com:5000"
+    zooproxy_gateway_account: str = ""
+    zooproxy_gateway_password: str = ""
+    zooproxy_gateway_region: str = "US"
+    zooproxy_gateway_session_minutes: int = 10
+    ipwo_enabled: bool = False
+    ipwo_host: str = "us.ipwo.net:7878"
+    ipwo_username: str = ""
+    ipwo_password: str = ""
+    ipwo_zone: str = "NA"
+    ipwo_scheme: str = "http"
+    ipwo_session_minutes: int = 10
+    proxy_multi_country: bool = True
+    proxy_countries_zoo: str = ""
+    proxy_countries_ipwo: str = ""
+    proxy_dual_mode: str = "split_workers"
     # 注册成功后自动绑定 TOTP 2FA。前端两个页面都**默认开**（主人要求每个号都绑）。
     # 这里的 default 保持 False —— 它只在「调用方没传这个字段」时生效，是给旧前端
     # 缓存 / 直接打 API 的保守兜底：漏传时宁可不绑，也不替调用方做一个不可逆的决定。
@@ -249,6 +275,46 @@ def api_proxy_test(req: ProxyTestReq):
     return {"ok": True, "results": results}
 
 
+class ZooProxyTestReq(BaseModel):
+    mode: str = Field("gateway", description="gateway | api")
+    api_url: str = ""
+    scheme: str = Field("http", description="api 模式：http / socks5")
+    gateway_host: str = "us-eu.zooproxy.com:5000"
+    gateway_account: str = ""
+    gateway_password: str = ""
+    gateway_region: str = "US"
+    gateway_session_minutes: int = 10
+
+
+@app.post("/api/proxy/zooproxy/fetch")
+def api_zooproxy_fetch(req: ZooProxyTestReq):
+    """试拉一条 ZooProxy 代理（网关 SOCKS5 或白名单 API）。"""
+    import sys as _sys
+
+    ROOT_DIR = Path(__file__).resolve().parents[1]
+    if str(ROOT_DIR) not in _sys.path:
+        _sys.path.insert(0, str(ROOT_DIR))
+    try:
+        from zooproxy import ZooProxyError, resolve_zooproxy_proxy
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"加载 zooproxy 失败: {e}") from e
+    opts = {
+        "zooproxy_mode": req.mode,
+        "zooproxy_api_url": req.api_url,
+        "zooproxy_scheme": req.scheme,
+        "zooproxy_gateway_host": req.gateway_host,
+        "zooproxy_gateway_account": req.gateway_account,
+        "zooproxy_gateway_password": req.gateway_password,
+        "zooproxy_gateway_region": req.gateway_region,
+        "zooproxy_gateway_session_minutes": req.gateway_session_minutes,
+    }
+    try:
+        proxy = resolve_zooproxy_proxy(opts)
+    except ZooProxyError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "proxy": proxy.split("@")[-1]}
+
+
 @app.post("/api/register")
 def api_register(req: RegisterReq):
     """启动注册任务，返回 run_id。前端拿 run_id 去 /api/runs/{run_id}/stream 订阅 SSE。"""
@@ -292,7 +358,7 @@ def api_register(req: RegisterReq):
                 f"号池里没有 available 的 {provider_cls.display_name} 账号；请先批量导入",
             )
 
-    options = {
+    options = apply_optimal_proxy_options({
         "want_access_token": req.want_access_token,
         "want_session_token": req.want_session_token,
         "want_refresh_token": req.want_refresh_token,
@@ -300,7 +366,27 @@ def api_register(req: RegisterReq):
         "otp_timeout": int(req.otp_timeout),
         "allow_existing_login": req.allow_existing_login,
         "want_2fa": req.want_2fa,
-    }
+        "zooproxy_enabled": req.zooproxy_enabled,
+        "zooproxy_mode": req.zooproxy_mode,
+        "zooproxy_api_url": req.zooproxy_api_url,
+        "zooproxy_scheme": req.zooproxy_scheme,
+        "zooproxy_gateway_host": req.zooproxy_gateway_host,
+        "zooproxy_gateway_account": req.zooproxy_gateway_account,
+        "zooproxy_gateway_password": req.zooproxy_gateway_password,
+        "zooproxy_gateway_region": req.zooproxy_gateway_region,
+        "zooproxy_gateway_session_minutes": req.zooproxy_gateway_session_minutes,
+        "ipwo_enabled": req.ipwo_enabled,
+        "ipwo_host": req.ipwo_host,
+        "ipwo_username": req.ipwo_username,
+        "ipwo_password": req.ipwo_password,
+        "ipwo_zone": req.ipwo_zone,
+        "ipwo_scheme": req.ipwo_scheme,
+        "ipwo_session_minutes": req.ipwo_session_minutes,
+        "proxy_multi_country": req.proxy_multi_country,
+        "proxy_countries_zoo": req.proxy_countries_zoo,
+        "proxy_countries_ipwo": req.proxy_countries_ipwo,
+        "proxy_dual_mode": req.proxy_dual_mode,
+    })
     run_id = registrar.start_registration(account, options)
     logger.info(f"[run] {run_id} -> {account['email']} (mail_source={mail_source})")
     return {"ok": True, "run_id": run_id, "email": account["email"]}
@@ -675,6 +761,13 @@ class SaveExportConfigReq(BaseModel):
     sub2api_api_key: Optional[str] = None   # '***' 不修改
     sub2api_group_ids: Optional[str] = None  # 逗号分隔，例 "2" 或 "1,2,3"
     sub2api_timeout: Optional[str] = None
+    # ChatGPT2API
+    chatgpt2api_enabled: Optional[str] = None
+    chatgpt2api_url: Optional[str] = None
+    chatgpt2api_admin_key: Optional[str] = None
+    chatgpt2api_target_group_id: Optional[str] = None
+    chatgpt2api_sync_after_import: Optional[str] = None  # "0" / "1"
+    chatgpt2api_timeout: Optional[str] = None
 
 
 @app.get("/api/settings/export")
@@ -689,7 +782,7 @@ def api_save_export_config(req: SaveExportConfigReq):
 
 
 class TestExportReq(BaseModel):
-    target: str = Field(..., description="cpa 或 sub2api")
+    target: str = Field(..., description="cpa、sub2api 或 chatgpt2api")
 
 
 @app.post("/api/settings/export/test")
@@ -703,6 +796,8 @@ def api_test_export(req: TestExportReq):
             return exporter.test_cpa(cfg["cpa"])
         if target == "sub2api":
             return exporter.test_sub2api(cfg["sub2api"])
+        if target == "chatgpt2api":
+            return exporter.test_chatgpt2api(cfg["chatgpt2api"])
         raise HTTPException(400, f"未知 target: {target}")
     except HTTPException:
         raise
@@ -710,44 +805,180 @@ def api_test_export(req: TestExportReq):
         raise HTTPException(500, f"测试失败: {e}")
 
 
+class PushTargetReq(BaseModel):
+    name: Optional[str] = None
+    type: Optional[str] = Field(default=None, description="cpa / sub2api / chatgpt2api / chat2api_go")
+    url: Optional[str] = None
+    credential: Optional[str] = Field(default=None, description="传 '***' 表示不修改")
+    group_id: Optional[str] = None
+    weight: Optional[int] = Field(default=None, ge=1, le=100)
+    enabled: Optional[bool] = None
+    timeout: Optional[int] = Field(default=None, ge=1, le=600)
+
+
+@app.get("/api/push-targets")
+def api_list_push_targets():
+    """列出所有推送目标。密文字段以 *** 占位，前端不会拿到明文。"""
+    items = []
+    for target in db.list_push_targets():
+        item = dict(target)
+        item["has_credential"] = bool(item.get("credential"))
+        item["credential"] = "***" if item.get("credential") else ""
+        items.append(item)
+    return {
+        "ok": True,
+        "targets": items,
+        "types": [
+            {"value": kind, "label": db.PUSH_TARGET_TYPE_LABELS.get(kind, kind)}
+            for kind in db.PUSH_TARGET_TYPES
+        ],
+    }
+
+
+@app.post("/api/push-targets")
+def api_create_push_target(req: PushTargetReq):
+    try:
+        target_id = db.create_push_target(req.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "id": target_id}
+
+
+@app.put("/api/push-targets/{target_id}")
+def api_update_push_target(target_id: int, req: PushTargetReq):
+    try:
+        changed = db.update_push_target(target_id, req.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if not changed:
+        raise HTTPException(404, f"未找到推送目标: {target_id}")
+    return {"ok": True}
+
+
+@app.delete("/api/push-targets/{target_id}")
+def api_delete_push_target(target_id: int):
+    if not db.delete_push_target(target_id):
+        raise HTTPException(404, f"未找到推送目标: {target_id}")
+    return {"ok": True}
+
+
+@app.post("/api/push-targets/{target_id}/test")
+def api_test_push_target(target_id: int):
+    """连通性测试：不消耗真实账号，只验证鉴权与地址。"""
+    from . import exporter
+    target = db.get_push_target(target_id)
+    if not target:
+        raise HTTPException(404, f"未找到推送目标: {target_id}")
+    try:
+        result = exporter.test_target(target)
+    except Exception as exc:
+        raise HTTPException(500, f"测试失败: {exc}")
+    return {"ok": bool(result.get("ok")), "result": result}
+
+
+class RetryPushReq(BaseModel):
+    target_id: Optional[int] = Field(default=None, description="只重推该目标；为空则按权重随机")
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+@app.post("/api/push-targets/retry")
+def api_retry_pending_push(req: RetryPushReq):
+    """把 registered 里推送失败（extra_json.push.ok=false）的账号再推一次。
+
+    只挑「失败」的，不碰已成功的，避免重复入库。
+    """
+    from . import exporter
+    pending = db.list_registered_push_pending(limit=req.limit)
+    if not pending:
+        return {"ok": True, "attempted": 0, "succeeded": 0, "results": []}
+    target = db.get_push_target(req.target_id) if req.target_id else db.pick_push_target()
+    if not target:
+        raise HTTPException(400, "没有可用的推送目标")
+    results = []
+    succeeded = 0
+    for cred in pending:
+        result = exporter.run_exports_to_target(cred, target)
+        ok = bool(result.get("ok"))
+        message = str(result.get("message") or result.get("error") or "")
+        db.record_push_result(int(target["id"]), ok, message)
+        db.mark_registered_push(cred.get("email", ""), {
+            "target_id": target.get("id"),
+            "target_name": target.get("name"),
+            "type": target.get("type"),
+            "ok": ok,
+            "message": message[:500],
+            "at": __import__("time").time(),
+        })
+        succeeded += 1 if ok else 0
+        results.append({"email": cred.get("email"), "ok": ok, "message": message})
+    return {
+        "ok": True,
+        "attempted": len(pending),
+        "succeeded": succeeded,
+        "results": results,
+        "target": {"id": target.get("id"), "name": target.get("name")},
+    }
+
+
 class ManualExportReq(BaseModel):
     email: str = Field(..., description="要导出的已注册账号邮箱")
-    targets: list[str] = Field(default_factory=lambda: ["cpa", "sub2api"],
-                                description="选择导出目标：cpa / sub2api")
+    target_ids: list[int] = Field(
+        default_factory=list,
+        description="推送到这些 push_targets.id；为空则按权重随机选一个启用中的目标",
+    )
+    targets: list[str] = Field(
+        default_factory=list,
+        description="兼容旧调用：按类型选 cpa / sub2api / chatgpt2api / chat2api_go",
+    )
 
 
 @app.post("/api/registered/export_to_panel")
 def api_manual_export_to_panel(req: ManualExportReq):
-    """对一个已注册账号手动触发到面板的导出。
+    """对一个已注册账号手动触发推送。
 
-    targets 里选 cpa / sub2api 之一或全部。即使总开关未启用，本接口也会执行
-    （只要 URL/密钥 等基础配置已填）。
+    优先级：target_ids > targets（按类型）> 按权重随机。
     """
     from . import exporter
     cred = db.get_registered(req.email)
     if not cred:
         raise HTTPException(404, f"未找到已注册账号: {req.email}")
 
-    cfg = db.get_export_internal_config()
-    out = {"email": req.email, "cpa": None, "sub2api": None}
-    targets = {t.strip().lower() for t in (req.targets or []) if t}
+    all_targets = db.list_push_targets()
+    selected: list[dict] = []
+    if req.target_ids:
+        wanted = {int(i) for i in req.target_ids}
+        selected = [t for t in all_targets if int(t["id"]) in wanted]
+    elif req.targets:
+        wanted_types = {t.strip().lower() for t in req.targets if t}
+        selected = [t for t in all_targets if t["type"] in wanted_types]
+    else:
+        picked = db.pick_push_target()
+        selected = [picked] if picked else []
+    if not selected:
+        raise HTTPException(404, "没有匹配的推送目标")
 
-    if "cpa" in targets:
-        cpa_cfg = dict(cfg["cpa"])
-        cpa_cfg["enabled"] = True  # 手动触发：强制启用
-        try:
-            out["cpa"] = exporter.export_to_cpa(cred, cpa_cfg)
-        except Exception as e:
-            out["cpa"] = {"ok": False, "error": str(e)}
-    if "sub2api" in targets:
-        sub2api_cfg = dict(cfg["sub2api"])
-        sub2api_cfg["enabled"] = True
-        try:
-            out["sub2api"] = exporter.export_to_sub2api(cred, sub2api_cfg)
-        except Exception as e:
-            out["sub2api"] = {"ok": False, "error": str(e)}
-
-    return {"ok": True, **out}
+    results = []
+    for target in selected:
+        result = exporter.run_exports_to_target(cred, target)
+        ok = bool(result.get("ok"))
+        message = str(result.get("message") or result.get("error") or "")
+        db.record_push_result(int(target["id"]), ok, message)
+        db.mark_registered_push(req.email, {
+            "target_id": target.get("id"),
+            "target_name": target.get("name"),
+            "type": target.get("type"),
+            "ok": ok,
+            "message": message[:500],
+            "at": __import__("time").time(),
+        })
+        results.append({
+            "target_id": target.get("id"),
+            "target_name": target.get("name"),
+            "type": target.get("type"),
+            "ok": ok,
+            "message": message,
+        })
+    return {"ok": True, "email": req.email, "results": results}
 
 
 class UpdateCredReq(BaseModel):
@@ -992,6 +1223,16 @@ def api_check_plus(req: CheckPlusReq):
     return {"ok": True, "results": results, "note": note}
 
 
+@app.get("/api/settings/proxy_preset")
+def api_proxy_preset():
+    """VPS 最优代理配置 + .bench-secrets.env（私有部署用，免手填密码）。"""
+    return {
+        "ok": True,
+        "preset": preset_for_frontend(),
+        "secrets_loaded": SECRETS_PATH.is_file(),
+    }
+
+
 # ──────────────────────── auto-loop ────────────────────────
 
 
@@ -999,14 +1240,40 @@ class AutoLoopStartReq(BaseModel):
     """跟 RegisterReq 复用同样的字段，auto-loop 内部传给每个 run。"""
     want_access_token: bool = True
     want_session_token: bool = True
-    want_refresh_token: bool = True
+    want_refresh_token: bool = False
     proxy: str = ""              # 单代理（concurrency=1 + 无代理池时用）
-    proxy_pool: str = ""         # 多代理池（每行一个）；优先于 proxy
-    concurrency: int = 1         # 并发 worker 数（1-20）
-    otp_timeout: int = 10
+    proxy_pool: str = ""         # 多代理池（每行一个）；zooproxy 开启时忽略
+    concurrency: int = 1         # 并发 worker 数（1-100）
+    otp_timeout: int = 120
     allow_existing_login: bool = True
     cool_down_seconds: float = 3.0  # 每个 worker 跑完后冷却（防风控）
     target_count: int = 0        # 目标成功数（0=不限量，达标自动停止）
+    zooproxy_enabled: bool = False
+    zooproxy_mode: str = "gateway"
+    zooproxy_api_url: str = ""
+    zooproxy_scheme: str = "http"
+    zooproxy_gateway_host: str = "us-eu.zooproxy.com:5000"
+    zooproxy_gateway_account: str = ""
+    zooproxy_gateway_password: str = ""
+    zooproxy_gateway_region: str = "US"
+    zooproxy_gateway_session_minutes: int = 10
+    ipwo_enabled: bool = False
+    ipwo_host: str = "us.ipwo.net:7878"
+    ipwo_username: str = ""
+    ipwo_password: str = ""
+    ipwo_zone: str = "NA"
+    ipwo_scheme: str = "http"
+    ipwo_session_minutes: int = 10
+    proxy_multi_country: bool = True
+    proxy_countries_zoo: str = ""
+    proxy_countries_ipwo: str = ""
+    proxy_dual_mode: str = "split_workers"
+    # 每格在途上限（0 = 用后端预设）。并发提高时通常要同时提高它，
+    # 否则一旦格子都到上限，平衡器会退化成「全格兜底」而压低有效并发。
+    proxy_max_in_flight_per_cell: int = 0
+    auto_resume_on_network: bool = True
+    auto_resume_delay_seconds: float = 45.0
+    zooproxy_fail_sleep: float = 15.0
     # 批量页已放开关且**默认开**（主人要求每个号都绑）。
     # 这里的 default 仍保持 False —— 它只在「前端没传这个字段」时生效，
     # 是给旧前端缓存 / 直接打 API 的保守兜底：漏传时宁可不绑，也不要
@@ -1016,7 +1283,7 @@ class AutoLoopStartReq(BaseModel):
 
 @app.post("/api/auto/start")
 def api_auto_start(req: AutoLoopStartReq):
-    res = AUTO_LOOP.start(req.model_dump())
+    res = AUTO_LOOP.start(apply_for_auto_loop(req.model_dump()))
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "启动失败"))
     return res

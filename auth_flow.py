@@ -828,10 +828,15 @@ class AuthFlow:
         self.result.id_token = data.get("id_token", self.result.id_token)
         self.result.access_token = data.get("access_token", self.result.access_token)
         self.result.refresh_token = data.get("refresh_token", self.result.refresh_token)
+        if data.get("access_token"):
+            # Codex AT 与 NextAuth AT 不同；有 RT 时保留 Codex AT 供导出/刷新，Web AT 仍由 get_auth_session 维护
+            if (self.result.refresh_token or "").strip():
+                self.result.access_token = data.get("access_token", self.result.access_token)
         logger.info(
-            "Codex OAuth 交换成功: access=%s refresh=%s",
+            "Codex OAuth 交换成功: access=%s refresh=%s (rt_len=%s)",
             "有" if self.result.access_token else "无",
             "有" if self.result.refresh_token else "无",
+            len(self.result.refresh_token or ""),
         )
         return True
 
@@ -1537,6 +1542,27 @@ class AuthFlow:
 
         return out
 
+    def _rotate_proxy_ip(self) -> bool:
+        """换一条出口 IP（同格换 sid），返回是否换成功。
+
+        与 `_rotate_impersonate_session` 的分工：那个换的是 **TLS 指纹**，
+        这个换的是 **出口 IP**。两者治的病不一样，别混用。
+        回调由 registrar 注入（config.proxy_rotate），直连/静态代理时不存在，
+        此时返回 False，调用方走退避重试。
+        """
+        rotate = getattr(self.config, "proxy_rotate", None)
+        if not callable(rotate):
+            return False
+        try:
+            new_proxy = rotate()
+        except Exception as e:  # noqa: BLE001 - 换 IP 失败绝不能打断注册
+            logger.warning(f"换出口 IP 异常（沿用旧代理）: {e}")
+            return False
+        if not new_proxy:
+            return False
+        self.config.proxy = new_proxy
+        return True
+
     def _rotate_impersonate_session(self) -> bool:
         """仅在 curl_cffi 指纹模式内切换 UA 指纹版本重试，同时联动更新 UA。
 
@@ -1731,9 +1757,13 @@ class AuthFlow:
 
         for attempt in range(4):
             if attempt:
-                # 只换出口 IP（新 session = 新出口），指纹保持不变：
+                # 只换出口 IP（新 sid = 新出口 IP），指纹保持不变：
                 # 403 是缺 client hints 导致的，已在头里修好，不是指纹的锅。
-                time.sleep(3 + attempt * 2)
+                # ⚠️ 必须真的换 IP：同 sid 的出口是粘的（实测 4 次请求同一 IP），
+                #    拿旧代理原样重试只是在等同一个坏 IP，纯烧时间。
+                # 换不到新 IP 才退回退避等待（总比立刻重打同一个坏 IP 强）。
+                if not self._rotate_proxy_ip():
+                    time.sleep(3 + attempt * 2)
                 self.session = create_http_session(
                     proxy=self.config.proxy,
                     impersonate=self._impersonate_candidates[self._impersonate_idx],
@@ -2853,15 +2883,27 @@ class AuthFlow:
         )
         session_token = cookie_st or json_st
         access_token = sess_json.get("accessToken", "") or sess_json.get("access_token", "") or ""
+        refresh_token = (
+            sess_json.get("refreshToken", "")
+            or sess_json.get("refresh_token", "")
+            or ""
+        ).strip()
 
         if session_token:
             self.result.session_token = session_token
         if access_token:
             self.result.access_token = access_token
+        if refresh_token and not (self.result.refresh_token or "").strip():
+            self.result.refresh_token = refresh_token
+            logger.info("session 响应携带 refresh_token，已写入 result")
         self.result.cookie_header = self._build_chatgpt_cookie_header()
 
         _log = logger.info if first_call else logger.debug
-        _log(f"session: st={'有' if session_token else '无'} at={'有' if access_token else '无'}")
+        _log(
+            f"session: st={'有' if session_token else '无'} "
+            f"at={'有' if access_token else '无'} "
+            f"rt={'有' if (self.result.refresh_token or '').strip() else '无'}"
+        )
         return session_token, access_token
 
     def _consume_callback_for_session(self, callback_url: str) -> bool:
@@ -3453,13 +3495,40 @@ class AuthFlow:
             if self._env_flag("OAUTH_TOKEN_EXCHANGE_FROM_CALLBACK", "0") \
                     and not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0"):
                 self.oauth_token_exchange(callback_url or "", continue_url or "")
-            if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
-                self.oauth_codex_rt_exchange(mail_provider=mail_provider)
+            if self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
+                try:
+                    max_attempts = max(1, int(self._get_env("OAUTH_CODEX_RT_MAX_ATTEMPTS", "3")))
+                except Exception:
+                    max_attempts = 3
+                try:
+                    retry_sleep = max(0.0, float(self._get_env("OAUTH_CODEX_RT_RETRY_SLEEP", "1.5")))
+                except Exception:
+                    retry_sleep = 1.5
+                for attempt in range(max_attempts):
+                    if (self.result.refresh_token or "").strip():
+                        break
+                    if attempt > 0:
+                        self._codex_rt_attempted = False
+                        time.sleep(retry_sleep)
+                        logger.info(
+                            "Codex OAuth 换 RT 重试 %s/%s ...",
+                            attempt + 1,
+                            max_attempts,
+                        )
+                    self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             if (not self.result.refresh_token) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):
                 self.oauth_secondary_authorize_exchange()
             # 最终再拉一次 session（Codex 流程可能更新 cookie/access_token）
             if not refresh_only_mode:
+                codex_at = (
+                    self.result.access_token
+                    if (self.result.refresh_token or "").strip()
+                    else ""
+                )
                 self.get_auth_session()
+                if (self.result.refresh_token or "").strip() and codex_at:
+                    # get_auth_session 会覆盖为 Web accessToken；导出侧用 RT 刷新 Codex AT，这里保留 RT 即可
+                    pass
 
         if refresh_only_mode:
             if not (self.result.refresh_token or self.result.access_token):

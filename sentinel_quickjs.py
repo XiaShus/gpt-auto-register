@@ -45,6 +45,32 @@ SENTINEL_SDK_URL = f"https://sentinel.openai.com/sentinel/{SENTINEL_VERSION}/sdk
 SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
 
 
+def _wait_budget_overrides() -> dict:
+    """等待预算覆盖，全部走 env，便于不回滚代码就切换。
+
+    init 默认由 JS 侧给 200ms（实测死等修复）；token/SO/behavior 默认保持
+    历史值，只有显式设 env 才改变，避免动到风控相关行为。
+    """
+    out: dict = {}
+    for key, env in (
+        ("init_timeout_ms", "SENTINEL_INIT_TIMEOUT_MS"),
+        ("token_timeout_ms", "SENTINEL_TOKEN_TIMEOUT_MS"),
+        ("so_timeout_ms", "SENTINEL_SO_TIMEOUT_MS"),
+        ("behavior_duration_ms", "SENTINEL_BEHAVIOR_MS"),
+    ):
+        raw = (os.getenv(env) or "").strip()
+        if not raw:
+            continue
+        try:
+            val = int(float(raw))
+        except ValueError:
+            logger.warning("忽略非法 %s=%r", env, raw)
+            continue
+        if val > 0:
+            out[key] = val
+    return out
+
+
 def _resolve_node_binary() -> str:
     return (os.getenv("OPENAI_SENTINEL_NODE_PATH", "") or "").strip() or "node"
 
@@ -245,6 +271,7 @@ def get_sentinel_token_via_quickjs(
         "device_pixel_ratio": float(device_pixel_ratio) if device_pixel_ratio else 1.0,
         "max_touch_points": int(max_touch_points),
         "timezone": timezone or "UTC",  # IANA 时区名
+        **_wait_budget_overrides(),     # init/token/SO/behavior 等待预算
     }
     # deviceMemory 仅 Chromium 暴露；None 时不下发该键，JS 侧保持 undefined
     if device_memory is not None:
@@ -278,7 +305,8 @@ def get_sentinel_token_via_quickjs(
             "request_p": request_p,
             "challenge": challenge,
             "flow": flow,
-            "behavior_duration_ms": 4200,
+            # 默认保持历史值；SENTINEL_BEHAVIOR_MS 可覆盖（已在 env_payload 里）
+            "behavior_duration_ms": solve_payload.get("behavior_duration_ms", 4200),
         })
         solved = _run_quickjs_action(
             action="solve",

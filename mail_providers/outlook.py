@@ -67,6 +67,19 @@ _FATAL_IMAP_ERROR_PATTERNS = (
     "invalid_client",
 )
 
+# 微软已停用 IMAP 的 Basic（密码）认证，命中一次就是全局长期状态：
+# 之后再拿 password 去登录只会白白耗满整个 OTP 预算（此前单 run 实测烧掉 180s+）。
+_BASIC_AUTH_DISABLED_PATTERNS = (
+    "basic authentication is disabled",
+    "basic authentication has been disabled",
+)
+_BASIC_AUTH_DISABLED_GLOBALLY = False
+
+
+def _is_basic_auth_disabled(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return any(p in msg for p in _BASIC_AUTH_DISABLED_PATTERNS)
+
 
 def _is_fatal_imap_error(exc: Exception) -> bool:
     msg = str(exc or "").lower()
@@ -297,6 +310,7 @@ def fetch_otp_via_imap(
     target_email: str = "",
 ) -> str:
     """IMAP 轮询取 OTP（XOAUTH2 优先 + 密码兜底，双服务器轮询）。"""
+    global _BASIC_AUTH_DISABLED_GLOBALLY
     if not deadline:
         deadline = time.time() + max(60, timeout)
     if not threshold_ts:
@@ -308,6 +322,9 @@ def fetch_otp_via_imap(
     cached_at: float = 0.0
     use_xoauth2 = bool(client_id and refresh_token)
     use_password = bool(password)
+    if _BASIC_AUTH_DISABLED_GLOBALLY:
+        # 已确认密码登录被停用，别再拿它去撞 —— 每次都是一个完整的 OTP 超时。
+        use_password = False
     folders_to_scan = ["INBOX", "Junk", "Junk Email", "Spam"]
     found_folders: list[str] | None = None
 
@@ -488,6 +505,16 @@ def fetch_otp_via_imap(
         except FatalOutlookMailError:
             raise
         except Exception as e:
+            if _is_basic_auth_disabled(e):
+                # 一次性记死：后续 run 直接跳过密码兜底，不再重演 180s 空等。
+                _BASIC_AUTH_DISABLED_GLOBALLY = True
+                logger.warning(
+                    "[outlook-imap] 微软已停用 IMAP Basic 认证，"
+                    "后续将跳过密码兜底（仅用 XOAUTH2）"
+                )
+                raise FatalOutlookMailError(
+                    f"IMAP 不可用 {email_addr}: {e}"
+                ) from e
             if _is_fatal_imap_error(e):
                 raise FatalOutlookMailError(
                     f"IMAP 不可用 {email_addr}: {e}"

@@ -1,4 +1,4 @@
-"""导出注册凭证到 CPA / SUB2API 面板（路线 2 实现）。
+"""导出注册凭证到 CPA / SUB2API / ChatGPT2API 面板（路线 2 实现）。
 
 参考 zc-zhangchen/any-auto-register 的 platforms/chatgpt/cpa_upload.py 和 sub2api_upload.py。
 
@@ -14,6 +14,8 @@
      Bearer 鉴权，文件名 {email}.json
   2. SUB2API：直接 POST /api/v1/admin/accounts
      x-api-key 鉴权（无登录流程）
+  3. ChatGPT2API：POST /api/accounts（Bearer 管理员密钥）
+     body.accounts 使用与 CPA 导出相同的 codex JSON 对象
 
 全部用 curl_cffi impersonate="chrome110" 模拟浏览器 TLS 指纹，绕过 CF Bot 拦截。
 """
@@ -647,72 +649,535 @@ def test_sub2api(cfg: dict) -> dict:
     raise RuntimeError(f"SUB2API 返回 HTTP {resp.status_code}: {(resp.text or '')[:200]}")
 
 
+# ──────────────────────── ChatGPT2API：构建 payload / 上传 ────────────────────────
+
+
+def build_chatgpt2api_account_item(cred: dict) -> dict:
+    """ChatGPT2API POST /api/accounts 的 accounts[] 元素。
+
+    ChatGPT2API 号池里的 ``refresh_token`` 实际对应 Outlook Register「查看凭证」里的
+    **session_token**（NextAuth Web 会话），不是 Codex OAuth 的 refresh_token。
+    与面板手动把 session 贴进 RT 字段的行为一致。
+
+    仅当没有 session_token、但库里有 Codex OAuth refresh_token 时，才回落 CPA/codex JSON。
+    """
+    access_token = str(cred.get("access_token") or "").strip()
+    if not access_token:
+        raise RuntimeError("未读取到可导入的 access_token")
+    email = str(cred.get("email") or "").strip()
+    session_token = str(cred.get("session_token") or "").strip()
+    codex_refresh_token = str(cred.get("refresh_token") or "").strip()
+
+    if session_token:
+        id_token = str(cred.get("id_token") or "").strip()
+        if not id_token:
+            id_token = _build_compat_id_token(access_token=access_token, email=email)
+        payload = _decode_jwt_payload(access_token)
+        auth_info = _get_auth(payload)
+        item = {
+            "email": email,
+            "access_token": access_token,
+            # ChatGPT2API 用 refresh_token 存 Web session（用户口中的 RT）
+            "refresh_token": session_token,
+            "id_token": id_token,
+            "account_id": str(auth_info.get("chatgpt_account_id") or cred.get("account_id") or "").strip(),
+            "source_type": "chatgpt",
+            "session_token": session_token,
+        }
+        device_id = str(cred.get("device_id") or "").strip()
+        if device_id:
+            item["device_id"] = device_id
+        cookie_header = str(cred.get("cookie_header") or "").strip()
+        if cookie_header:
+            item["cookie_header"] = cookie_header
+    elif codex_refresh_token:
+        item = build_cpa_token_json(cred)
+    else:
+        id_token = str(cred.get("id_token") or "").strip()
+        if not id_token:
+            id_token = _build_compat_id_token(access_token=access_token, email=email)
+        payload = _decode_jwt_payload(access_token)
+        auth_info = _get_auth(payload)
+        item = {
+            "email": email,
+            "access_token": access_token,
+            "refresh_token": "",
+            "id_token": id_token,
+            "account_id": str(auth_info.get("chatgpt_account_id") or cred.get("account_id") or "").strip(),
+            "source_type": "chatgpt",
+        }
+        device_id = str(cred.get("device_id") or "").strip()
+        if device_id:
+            item["device_id"] = device_id
+        cookie_header = str(cred.get("cookie_header") or "").strip()
+        if cookie_header:
+            item["cookie_header"] = cookie_header
+
+    password = str(cred.get("password") or "").strip()
+    if password:
+        item["password"] = password
+    totp = str(cred.get("totp_secret") or cred.get("totp") or "").strip()
+    if totp:
+        item["totp_secret"] = totp
+    return item
+
+
+def _chatgpt2api_sync_flag(cfg: dict) -> bool:
+    raw = cfg.get("chatgpt2api_sync_after_import")
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def export_to_chatgpt2api(cred: dict, cfg: dict, *,
+                          log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
+    """ChatGPT2API 管理端导入账号（Bearer admin key）。"""
+    log = log_fn or (lambda m, lvl="info": logger.info(m))
+
+    api_url = (cfg.get("chatgpt2api_url") or "").rstrip("/").strip()
+    admin_key = (cfg.get("chatgpt2api_admin_key") or "").strip()
+    if not api_url:
+        raise RuntimeError("ChatGPT2API 未配置 URL")
+    if not admin_key:
+        raise RuntimeError("ChatGPT2API 未配置管理员密钥")
+
+    timeout = int(cfg.get("chatgpt2api_timeout") or DEFAULT_TIMEOUT)
+    cffi = _import_cffi()
+
+    account_item = build_chatgpt2api_account_item(cred)
+    email = account_item.get("email") or "unknown"
+    web_rt_len = len(str(account_item.get("refresh_token") or "").strip())
+    st_len = len(str(cred.get("session_token") or "").strip())
+    log(
+        f"[ChatGPT2API] 构建导入项 email={email} "
+        f"web_session_rt_len={web_rt_len} session_token_len={st_len} "
+        f"format={account_item.get('type') or 'chatgpt-web'}",
+        "info",
+    )
+    body: dict[str, Any] = {
+        "accounts": [account_item],
+        "sync_after_import": _chatgpt2api_sync_flag(cfg),
+        "return_items": False,
+    }
+    target_group = str(cfg.get("chatgpt2api_target_group_id") or "").strip()
+    if target_group:
+        body["target_group_id"] = target_group
+
+    url = f"{api_url}/api/accounts"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {admin_key}",
+    }
+
+    last_err = ""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            log(
+                f"[ChatGPT2API] 第 {attempt}/{MAX_ATTEMPTS} 次导入 {email} "
+                f"(sync_after_import={body['sync_after_import']})...",
+                "info",
+            )
+            resp = cffi.post(
+                url,
+                headers=headers,
+                json=body,
+                proxies=None,
+                verify=False,
+                timeout=timeout,
+                impersonate="chrome110",
+            )
+            if resp.status_code in (200, 201):
+                added = skipped = synced = 0
+                err_msg = ""
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        added = int(data.get("added") or 0)
+                        skipped = int(data.get("skipped") or 0)
+                        synced = int(data.get("synced") or 0)
+                        err_list = data.get("errors")
+                        if err_list:
+                            err_msg = str(err_list)[:300]
+                except Exception:
+                    pass
+                if err_msg and added <= 0 and skipped <= 0:
+                    return {"ok": False, "error": err_msg, "email": email}
+                msg = (
+                    f"ChatGPT2API 导入成功 (added={added}, skipped={skipped}, synced={synced})"
+                )
+                log(f"[ChatGPT2API] ✅ {email} {msg}", "ok")
+                return {
+                    "ok": True,
+                    "email": email,
+                    "message": msg,
+                    "added": added,
+                    "skipped": skipped,
+                    "synced": synced,
+                }
+            msg = f"HTTP {resp.status_code}"
+            try:
+                detail = resp.json()
+                if isinstance(detail, dict):
+                    err = detail.get("error")
+                    if isinstance(err, dict):
+                        msg = str(err.get("error") or err.get("message") or msg)
+                    else:
+                        msg = str(
+                            detail.get("message") or detail.get("msg")
+                            or detail.get("error") or detail.get("detail") or msg
+                        )
+            except Exception:
+                msg = f"{msg} - {(resp.text or '')[:200]}"
+            last_err = msg
+            if attempt < MAX_ATTEMPTS and resp.status_code >= 500:
+                delay = RETRY_DELAYS_S[attempt - 1]
+                log(f"[ChatGPT2API] 第 {attempt} 次失败 ({msg})，{delay:.0f}s 后重试", "warn")
+                time.sleep(delay)
+                continue
+            return {"ok": False, "error": msg, "email": email}
+        except Exception as e:
+            last_err = str(e)
+            if attempt < MAX_ATTEMPTS:
+                delay = RETRY_DELAYS_S[attempt - 1]
+                log(f"[ChatGPT2API] 第 {attempt} 次异常 ({e})，{delay:.0f}s 后重试", "warn")
+                time.sleep(delay)
+                continue
+            return {"ok": False, "error": str(e), "email": email}
+    return {"ok": False, "error": last_err or "重试耗尽", "email": email}
+
+
+def test_chatgpt2api(cfg: dict) -> dict:
+    """ChatGPT2API 连通性测试：GET /api/accounts 验证 Bearer 管理员密钥。"""
+    api_url = (cfg.get("chatgpt2api_url") or "").rstrip("/").strip()
+    admin_key = (cfg.get("chatgpt2api_admin_key") or "").strip()
+    if not api_url:
+        raise RuntimeError("ChatGPT2API 未配置 URL")
+    if not admin_key:
+        raise RuntimeError("ChatGPT2API 未配置管理员密钥")
+    timeout = int(cfg.get("chatgpt2api_timeout") or DEFAULT_TIMEOUT)
+    cffi = _import_cffi()
+
+    resp = cffi.get(
+        f"{api_url}/api/accounts?page=1&page_size=1",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {admin_key}",
+        },
+        proxies=None,
+        verify=False,
+        timeout=timeout,
+        impersonate="chrome110",
+    )
+    if resp.status_code in (200, 201):
+        return {"ok": True, "message": f"ChatGPT2API 连通正常 (HTTP {resp.status_code})"}
+    if resp.status_code in (401, 403):
+        raise RuntimeError(
+            f"ChatGPT2API 鉴权失败 (HTTP {resp.status_code})，请检查管理员密钥"
+        )
+    raise RuntimeError(
+        f"ChatGPT2API 返回 HTTP {resp.status_code}: {(resp.text or '')[:200]}"
+    )
+
+
+# ──────────────────────── chat2api-Go（多节点号池） ────────────────────────
+
+
+def export_to_chat2api_go(cred: dict, cfg: dict, *,
+                          log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
+    """推送到 Go 版号池（c2a/chat2api/src）的 /admin/api/accounts/import。
+
+    与 Python 版 ChatGPT2API 的差异（都来自源码，不是猜的）：
+      * 鉴权用 `X-Admin-Token` 头，不是 Bearer；
+      * body 是「账号对象数组」，不是 {accounts: [...]} 信封；
+      * 只认 access_token / refresh_token / email / account_id 这几个键。
+    """
+    log = log_fn or (lambda m, lvl="info": logger.info(m))
+    url = str(cfg.get("url") or "").strip().rstrip("/")
+    token = str(cfg.get("credential") or "").strip()
+    timeout = int(cfg.get("timeout") or 15)
+    email = str(cred.get("email") or "").strip()
+    if not url:
+        return {"ok": False, "error": "chat2api-Go 地址未配置"}
+    if not token:
+        return {"ok": False, "error": "chat2api-Go 管理令牌未配置"}
+
+    access_token = str(cred.get("access_token") or "").strip()
+    item = {
+        "access_token": access_token,
+        "refresh_token": str(cred.get("refresh_token") or "").strip(),
+        "email": email,
+        "account_id": str(cred.get("account_id") or "").strip(),
+    }
+    if not access_token:
+        return {"ok": False, "error": "缺少 access_token"}
+
+    endpoint = f"{url}/admin/api/accounts/import"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-Admin-Token": token,
+    }
+    payload = json.dumps([item], ensure_ascii=False).encode("utf-8")
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            log(f"[chat2api-Go] 第 {attempt}/{MAX_ATTEMPTS} 次导入 {email} -> {url}", "info")
+            resp = requests.post(
+                endpoint,
+                headers=headers,
+                data=payload,
+                timeout=timeout,
+                impersonate="chrome110",
+                verify=False,
+                proxies=None,
+            )
+            body = (resp.text or "")[:400]
+            if resp.status_code in (200, 201):
+                log(f"[chat2api-Go] ✅ 导入成功: {body[:200]}", "ok")
+                return {"ok": True, "response": resp.json() if resp.text else {}}
+            log(f"[chat2api-Go] HTTP {resp.status_code}: {body}", "error")
+            if attempt < MAX_ATTEMPTS and resp.status_code >= 500:
+                time.sleep(RETRY_DELAYS_S[attempt - 1])
+                continue
+            return {"ok": False, "error": f"HTTP {resp.status_code}: {body[:200]}"}
+        except Exception as exc:
+            log(f"[chat2api-Go] 请求异常: {exc}", "error")
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_DELAYS_S[attempt - 1])
+                continue
+            return {"ok": False, "error": str(exc)}
+    return {"ok": False, "error": "unreachable"}
+
+
+def export_to_target(cred: dict, target: dict, *,
+                     log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
+    """按目标类型分发。返回统一的 {ok, message, response?} 结构。"""
+    kind = str(target.get("type") or "").strip()
+    cfg = {
+        "url": target.get("url"),
+        "credential": target.get("credential"),
+        "group_id": target.get("group_id"),
+        "timeout": target.get("timeout") or DEFAULT_TIMEOUT,
+    }
+    if kind == "cpa":
+        return export_to_cpa(cred, {
+            "cpa_url": cfg["url"],
+            "cpa_mgmt_key": cfg["credential"],
+            "cpa_timeout": cfg["timeout"],
+        }, log_fn=log_fn)
+    if kind == "sub2api":
+        return export_to_sub2api(cred, {
+            "sub2api_url": cfg["url"],
+            "sub2api_api_key": cfg["credential"],
+            "sub2api_group_ids": cfg["group_id"] or ",".join(
+                str(g) for g in DEFAULT_SUB2API_GROUP_IDS
+            ),
+            "sub2api_timeout": cfg["timeout"],
+        }, log_fn=log_fn)
+    if kind == "chatgpt2api":
+        return export_to_chatgpt2api(cred, {
+            "chatgpt2api_url": cfg["url"],
+            "chatgpt2api_admin_key": cfg["credential"],
+            "chatgpt2api_target_group_id": cfg["group_id"] or "",
+            "chatgpt2api_sync_after_import": True,
+            "chatgpt2api_timeout": cfg["timeout"],
+        }, log_fn=log_fn)
+    if kind == "chat2api_go":
+        return export_to_chat2api_go(cred, cfg, log_fn=log_fn)
+    return {"ok": False, "error": f"未知目标类型: {kind}"}
+
+
+def run_exports_to_target(cred: dict, target: dict, *,
+                          log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
+    """推送到单个目标；CPA / SUB2API 需要先把 refresh_token 换成 Codex token。"""
+    log = log_fn or (lambda m, lvl="info": logger.info(m))
+    kind = str(target.get("type") or "").strip()
+    export_cred = dict(cred)
+    needs_codex = kind in ("cpa", "sub2api")
+    if needs_codex:
+        refresh_token = str(cred.get("refresh_token") or "").strip()
+        if not refresh_token:
+            return {"ok": False, "error": "缺少 refresh_token，无法换取 Codex token"}
+        try:
+            log("[exporter] 用 refresh_token 换新的 Codex access_token...", "info")
+            fresh = refresh_codex_token(refresh_token)
+            export_cred.update({
+                "access_token": fresh["access_token"],
+                "refresh_token": fresh.get("refresh_token") or refresh_token,
+                "id_token": fresh.get("id_token") or cred.get("id_token", ""),
+            })
+            log("[exporter] ✅ Codex token 刷新成功", "ok")
+        except Exception as exc:
+            return {"ok": False, "error": f"Codex token 刷新失败: {exc}"}
+    try:
+        return export_to_target(export_cred, target, log_fn=log)
+    except Exception as exc:
+        log(f"[exporter] 目标 {target.get('name')} 导出异常: {exc}", "error")
+        return {"ok": False, "error": str(exc)}
+
+
+def test_target(target: dict) -> dict:
+    """按目标类型做连通性测试（不带真实账号，只验证鉴权与地址）。
+
+    刻意只做「最小只读请求」：CPA/SUB2API/ChatGPT2API 复用各自的 test_*；
+    chat2api-Go 没有健康端点（非 /v1 路径一律 404），因此改为请求
+    /admin/api/accounts 的列表页并只看「不是 401」。
+    """
+    kind = str(target.get("type") or "").strip()
+    cfg = {
+        "url": target.get("url"),
+        "credential": target.get("credential"),
+        "group_id": target.get("group_id"),
+        "timeout": target.get("timeout") or DEFAULT_TIMEOUT,
+    }
+    if kind == "cpa":
+        return test_cpa({
+            "cpa_url": cfg["url"],
+            "cpa_mgmt_key": cfg["credential"],
+            "cpa_timeout": cfg["timeout"],
+        })
+    if kind == "sub2api":
+        return test_sub2api({
+            "sub2api_url": cfg["url"],
+            "sub2api_api_key": cfg["credential"],
+            "sub2api_group_ids": cfg["group_id"] or "",
+            "sub2api_timeout": cfg["timeout"],
+        })
+    if kind == "chatgpt2api":
+        return test_chatgpt2api({
+            "chatgpt2api_url": cfg["url"],
+            "chatgpt2api_admin_key": cfg["credential"],
+            "chatgpt2api_timeout": cfg["timeout"],
+        })
+    if kind == "chat2api_go":
+        url = str(cfg["url"] or "").strip().rstrip("/")
+        token = str(cfg["credential"] or "").strip()
+        if not url:
+            return {"ok": False, "error": "地址未配置"}
+        if not token:
+            return {"ok": False, "error": "管理令牌未配置"}
+        try:
+            resp = requests.get(
+                f"{url}/admin/api/accounts?limit=1",
+                headers={"X-Admin-Token": token, "Accept": "application/json"},
+                timeout=int(cfg["timeout"]),
+                impersonate="chrome110",
+                verify=False,
+                proxies=None,
+            )
+            if resp.status_code == 401:
+                return {"ok": False, "error": "管理令牌被拒绝（X-Admin-Token）"}
+            if resp.status_code >= 500:
+                return {"ok": False, "error": f"上游错误 HTTP {resp.status_code}"}
+            return {"ok": True, "status": resp.status_code}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+    return {"ok": False, "error": f"未知目标类型: {kind}"}
+
+
 # ──────────────────────── 统一入口（注册完成后调用） ────────────────────────
 
 
 def run_exports(cred: dict, *,
                   cpa_cfg: Optional[dict] = None,
                   sub2api_cfg: Optional[dict] = None,
+                  chatgpt2api_cfg: Optional[dict] = None,
                   log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
     """注册完成后的可选导出入口。
 
     步骤：
-      1. 检查两个目标是否有任一启用，全部未启用直接返回
-      2. 用 cred['refresh_token'] 刷新一次拿新的 Codex access_token / id_token
-         （主项目最终保存的 access_token 是 NextAuth 风格的，CPA/SUB2API 不接受）
-      3. 用刷新后的 cred 走 CPA / SUB2API 导出
+      1. 检查目标是否有任一启用
+      2. CPA/SUB2API：需要 Codex OAuth refresh_token，先刷新 access_token 再导出
+      3. ChatGPT2API：用 access_token + session_token（写入 payload 的 refresh_token），不跑 Codex 刷新
 
     返回：
-        {"cpa": {...} 或 None, "sub2api": {...} 或 None, "any_attempted": bool}
+        {"cpa": {...} 或 None, "sub2api": {...} 或 None,
+         "chatgpt2api": {...} 或 None, "any_attempted": bool}
     """
     log = log_fn or (lambda m, lvl="info": logger.info(m))
-    out: dict = {"cpa": None, "sub2api": None, "any_attempted": False}
+    out: dict = {"cpa": None, "sub2api": None, "chatgpt2api": None, "any_attempted": False}
 
     cpa_on = bool(cpa_cfg and cpa_cfg.get("enabled"))
     sub2_on = bool(sub2api_cfg and sub2api_cfg.get("enabled"))
-    if not (cpa_on or sub2_on):
+    c2a_on = bool(chatgpt2api_cfg and chatgpt2api_cfg.get("enabled"))
+    if not (cpa_on or sub2_on or c2a_on):
         return out
 
-    # ─ 关键：先用 refresh_token 换 Codex 风格 access_token ─
-    try:
-        log("[exporter] 用 refresh_token 换新的 Codex access_token...", "info")
-        fresh = refresh_codex_token(cred.get("refresh_token", ""))
-        cred = {
-            **cred,
-            "access_token":  fresh["access_token"],
-            "refresh_token": fresh.get("refresh_token") or cred.get("refresh_token"),
-            "id_token":      fresh.get("id_token") or cred.get("id_token", ""),
-        }
+    has_codex_rt = bool(str(cred.get("refresh_token") or "").strip())
+    has_web_session = bool(str(cred.get("session_token") or "").strip())
+    needs_codex_refresh = (cpa_on or sub2_on) and has_codex_rt
+    codex_cred = dict(cred)
+    codex_refresh_ok = not needs_codex_refresh
+
+    if needs_codex_refresh:
+        try:
+            log("[exporter] 用 refresh_token 换新的 Codex access_token...", "info")
+            fresh = refresh_codex_token(cred.get("refresh_token", ""))
+            codex_cred = {
+                **cred,
+                "access_token": fresh["access_token"],
+                "refresh_token": fresh.get("refresh_token") or cred.get("refresh_token"),
+                "id_token": fresh.get("id_token") or cred.get("id_token", ""),
+            }
+            log(
+                f"[exporter] ✅ Codex token 刷新成功 "
+                f"(access_token len={len(fresh['access_token'])} "
+                f"id_token len={len(fresh.get('id_token') or '')})",
+                "ok",
+            )
+            codex_refresh_ok = True
+        except Exception as e:
+            log(f"[exporter] ❌ Codex token 刷新失败: {e}", "error")
+            if cpa_on:
+                out["any_attempted"] = True
+                out["cpa"] = {"ok": False, "error": f"Codex token 刷新失败: {e}"}
+            if sub2_on:
+                out["any_attempted"] = True
+                out["sub2api"] = {"ok": False, "error": f"Codex token 刷新失败: {e}"}
+            if (cpa_on or sub2_on) and not codex_refresh_ok:
+                return out
+    elif c2a_on:
         log(
-            f"[exporter] ✅ Codex token 刷新成功 "
-            f"(access_token len={len(fresh['access_token'])} "
-            f"id_token len={len(fresh.get('id_token') or '')})",
-            "ok",
+            "[exporter] ChatGPT2API：使用 Web session_token（不经过 Codex OAuth 刷新）",
+            "info",
         )
-    except Exception as e:
-        log(f"[exporter] ❌ Codex token 刷新失败，无法导出: {e}", "error")
-        if cpa_on:
-            out["any_attempted"] = True
-            out["cpa"] = {"ok": False, "error": f"Codex token 刷新失败: {e}"}
-        if sub2_on:
-            out["any_attempted"] = True
-            out["sub2api"] = {"ok": False, "error": f"Codex token 刷新失败: {e}"}
-        return out
 
     if cpa_on:
         out["any_attempted"] = True
-        try:
-            out["cpa"] = export_to_cpa(cred, cpa_cfg, log_fn=log)
-        except Exception as e:
-            log(f"[CPA] 导出异常: {e}", "error")
-            out["cpa"] = {"ok": False, "error": str(e)}
+        if codex_refresh_ok:
+            try:
+                out["cpa"] = export_to_cpa(codex_cred, cpa_cfg, log_fn=log)
+            except Exception as e:
+                log(f"[CPA] 导出异常: {e}", "error")
+                out["cpa"] = {"ok": False, "error": str(e)}
 
     if sub2_on:
         out["any_attempted"] = True
+        if codex_refresh_ok:
+            try:
+                out["sub2api"] = export_to_sub2api(codex_cred, sub2api_cfg, log_fn=log)
+            except Exception as e:
+                log(f"[SUB2API] 导出异常: {e}", "error")
+                out["sub2api"] = {"ok": False, "error": str(e)}
+
+    if c2a_on:
+        out["any_attempted"] = True
+        c2a_cred = dict(cred)
+        c2a_cfg = dict(chatgpt2api_cfg or {})
+        can_sync = has_web_session or (
+            has_codex_rt and not has_web_session
+        )
+        if not can_sync:
+            c2a_cfg["chatgpt2api_sync_after_import"] = False
+        elif chatgpt2api_cfg.get("chatgpt2api_sync_after_import") is None:
+            c2a_cfg["chatgpt2api_sync_after_import"] = True
         try:
-            out["sub2api"] = export_to_sub2api(cred, sub2api_cfg, log_fn=log)
+            out["chatgpt2api"] = export_to_chatgpt2api(c2a_cred, c2a_cfg, log_fn=log)
         except Exception as e:
-            log(f"[SUB2API] 导出异常: {e}", "error")
-            out["sub2api"] = {"ok": False, "error": str(e)}
+            log(f"[ChatGPT2API] 导出异常: {e}", "error")
+            out["chatgpt2api"] = {"ok": False, "error": str(e)}
 
     return out
